@@ -8,7 +8,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
 from app import db, service
+from app.ai_runtime import AIProcessingError, AIRuntimeError
 from app.alerts import generate_alerts
+from app.capabilities import get_capabilities
 from app.config import settings
 from app.gmail_integration import (
     GmailNotConnectedError,
@@ -23,6 +25,7 @@ from app.gmail_integration import (
 )
 from app.schemas import (
     AlertsResponse,
+    CapabilitiesResponse,
     GmailMessageDetail,
     GmailMessageListResponse,
     GoogleConnectionStatus,
@@ -52,6 +55,21 @@ app.add_middleware(
 )
 
 
+def _require_ai_capability() -> None:
+    capabilities = get_capabilities()
+    if capabilities.can_rank_inbox:
+        return
+    raise HTTPException(status_code=503, detail=capabilities.openai.message)
+
+
+def _raise_ai_http_error(exc: Exception) -> None:
+    if isinstance(exc, AIRuntimeError):
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if isinstance(exc, AIProcessingError):
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    raise HTTPException(status_code=500, detail="Unexpected AI processing failure.") from exc
+
+
 @app.get("/")
 def root() -> dict[str, str]:
     return {"service": settings.app_name, "status": "ok"}
@@ -60,6 +78,11 @@ def root() -> dict[str, str]:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "healthy"}
+
+
+@app.get("/capabilities", response_model=CapabilitiesResponse)
+def capabilities() -> CapabilitiesResponse:
+    return get_capabilities()
 
 
 @app.put("/profile", response_model=UserProfile)
@@ -75,43 +98,59 @@ def get_profile() -> UserProfile:
 
 @app.post("/emails/ingest", response_model=IngestResponse)
 def ingest_emails(request: IngestRequest) -> IngestResponse:
+    _require_ai_capability()
     profile = db.get_profile()
-    for email in request.emails:
-        service.process_email(email, profile)
-    return IngestResponse(ingested=len(request.emails))
+    try:
+        for email in request.emails:
+            service.process_email(email, profile)
+        return IngestResponse(ingested=len(request.emails))
+    except (AIRuntimeError, AIProcessingError) as exc:
+        _raise_ai_http_error(exc)
 
 
 @app.get("/emails", response_model=list[ProcessedEmail])
-def list_emails(limit: int = Query(default=50, ge=1, le=200)) -> list[ProcessedEmail]:
+def list_emails(limit: int = Query(default=50, ge=1, le=5000)) -> list[ProcessedEmail]:
     return service.list_recent_emails(limit=limit)
 
 
 @app.get("/dashboard")
 def dashboard(top_n: int = Query(default=5, ge=1, le=20)):
-    return service.build_dashboard(top_n=top_n)
+    _require_ai_capability()
+    try:
+        return service.build_dashboard(top_n=top_n)
+    except (AIRuntimeError, AIProcessingError) as exc:
+        _raise_ai_http_error(exc)
 
 
 @app.post("/qa", response_model=QAResponse)
 def qa(request: QARequest) -> QAResponse:
-    return service.qa_over_inbox(request.query, request.limit)
+    _require_ai_capability()
+    try:
+        return service.qa_over_inbox(request.query, request.limit)
+    except (AIRuntimeError, AIProcessingError) as exc:
+        _raise_ai_http_error(exc)
 
 
 @app.get("/alerts", response_model=AlertsResponse)
 def alerts() -> AlertsResponse:
+    _require_ai_capability()
     profile = db.get_profile()
-    deadline_items = db.list_with_deadlines(limit=40)
-    action_items = db.list_action_required(limit=40)
-    top_important = db.list_top_important(limit=60)
-    unread_important_count = db.count_unread_important(min_importance=7.0)
-    return AlertsResponse(
-        alerts=generate_alerts(
-            profile=profile,
-            deadlines=deadline_items,
-            action_required=action_items,
-            top_important=top_important,
-            unread_important_count=unread_important_count,
+    try:
+        deadline_items = db.list_with_deadlines(limit=40)
+        action_items = db.list_action_required(limit=40)
+        top_important = db.list_top_important(limit=60)
+        unread_important_count = db.count_unread_important(min_importance=7.0)
+        return AlertsResponse(
+            alerts=generate_alerts(
+                profile=profile,
+                deadlines=deadline_items,
+                action_required=action_items,
+                top_important=top_important,
+                unread_important_count=unread_important_count,
+            )
         )
-    )
+    except (AIRuntimeError, AIProcessingError) as exc:
+        _raise_ai_http_error(exc)
 
 
 @app.get("/gmail/connection", response_model=GoogleConnectionStatus)
@@ -201,16 +240,23 @@ def gmail_sync(
     q: str | None = Query(default=None),
     label_ids: list[str] | None = Query(default=None),
     clear_non_gmail: bool = Query(default=False),
+    backfill: bool = Query(default=False),
+    reset_backfill: bool = Query(default=False),
 ) -> IngestResponse:
+    _require_ai_capability()
     try:
         ingested = service.sync_connected_gmail(
             max_messages=max_messages,
             query=q,
             label_ids=label_ids,
             clear_non_gmail=clear_non_gmail,
+            backfill=backfill,
+            reset_backfill=reset_backfill,
         )
         return IngestResponse(ingested=ingested)
     except GmailNotConnectedError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except (AIRuntimeError, AIProcessingError) as exc:
+        _raise_ai_http_error(exc)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

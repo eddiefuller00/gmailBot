@@ -42,6 +42,18 @@ def _connect() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _ensure_column(conn: sqlite3.Connection, table_name: str, definition: str) -> None:
+    column_name = definition.split()[0]
+    if column_name in _table_columns(conn, table_name):
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {definition}")
+
+
 def init_db() -> None:
     with _connect() as conn:
         conn.execute(
@@ -73,10 +85,24 @@ def init_db() -> None:
                 company TEXT,
                 summary TEXT NOT NULL,
                 scoring_breakdown TEXT NOT NULL,
-                embedding TEXT NOT NULL
+                embedding TEXT NOT NULL DEFAULT '[]'
             )
             """
         )
+        for definition in (
+            "confidence REAL NOT NULL DEFAULT 0",
+            "is_bulk INTEGER NOT NULL DEFAULT 0",
+            "action_channel TEXT NOT NULL DEFAULT 'none'",
+            "ai_source TEXT NOT NULL DEFAULT 'openai'",
+            "prompt_version TEXT NOT NULL DEFAULT ''",
+            "processing_version TEXT NOT NULL DEFAULT ''",
+            "gmail_message_id TEXT",
+            "gmail_thread_id TEXT",
+            "content_fingerprint TEXT",
+            "last_processed_at TEXT",
+            "last_synced_at TEXT",
+        ):
+            _ensure_column(conn, "emails", definition)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_emails_received_at ON emails(received_at DESC)"
         )
@@ -84,6 +110,9 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_emails_importance ON emails(importance DESC)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_emails_category ON emails(category)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_emails_gmail_message_id ON emails(gmail_message_id)"
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS google_oauth_state (
@@ -104,6 +133,25 @@ def init_db() -> None:
                 email TEXT,
                 scopes TEXT NOT NULL,
                 connected_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gmail_sync_cursor (
+                scope_key TEXT PRIMARY KEY,
+                next_page_token TEXT,
+                is_complete INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_runtime_state (
+                key TEXT PRIMARY KEY,
+                value TEXT,
                 updated_at TEXT NOT NULL
             )
             """
@@ -145,16 +193,25 @@ def upsert_processed_email(
     unread: bool,
     metadata: ExtractedMetadata,
     embedding: list[float],
+    gmail_message_id: str | None = None,
+    gmail_thread_id: str | None = None,
+    content_fingerprint: str | None = None,
+    last_processed_at: datetime | None = None,
+    last_synced_at: datetime | None = None,
 ) -> None:
+    processed_at = last_processed_at or _utc_now()
+    synced_at = last_synced_at or _utc_now()
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO emails (
                 external_id, from_email, from_name, subject, body, cleaned_body, received_at, unread,
                 category, importance, reason, action_required, deadline, event_date, company, summary,
-                scoring_breakdown, embedding
+                confidence, is_bulk, action_channel, ai_source, prompt_version, processing_version,
+                scoring_breakdown, embedding, gmail_message_id, gmail_thread_id, content_fingerprint,
+                last_processed_at, last_synced_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(external_id) DO UPDATE SET
                 from_email=excluded.from_email,
                 from_name=excluded.from_name,
@@ -171,8 +228,19 @@ def upsert_processed_email(
                 event_date=excluded.event_date,
                 company=excluded.company,
                 summary=excluded.summary,
+                confidence=excluded.confidence,
+                is_bulk=excluded.is_bulk,
+                action_channel=excluded.action_channel,
+                ai_source=excluded.ai_source,
+                prompt_version=excluded.prompt_version,
+                processing_version=excluded.processing_version,
                 scoring_breakdown=excluded.scoring_breakdown,
-                embedding=excluded.embedding
+                embedding=excluded.embedding,
+                gmail_message_id=excluded.gmail_message_id,
+                gmail_thread_id=excluded.gmail_thread_id,
+                content_fingerprint=excluded.content_fingerprint,
+                last_processed_at=excluded.last_processed_at,
+                last_synced_at=excluded.last_synced_at
             """,
             (
                 external_id,
@@ -191,8 +259,19 @@ def upsert_processed_email(
                 _to_iso(metadata.event_date),
                 metadata.company,
                 metadata.summary,
+                float(metadata.confidence),
+                int(metadata.is_bulk),
+                metadata.action_channel,
+                metadata.ai_source,
+                metadata.prompt_version,
+                metadata.processing_version,
                 json.dumps(metadata.scoring_breakdown),
                 json.dumps(embedding),
+                gmail_message_id,
+                gmail_thread_id,
+                content_fingerprint,
+                _to_iso(processed_at),
+                _to_iso(synced_at),
             ),
         )
         conn.commit()
@@ -208,6 +287,12 @@ def _row_to_processed_email(row: sqlite3.Row) -> ProcessedEmail:
         event_date=_from_iso(row["event_date"]),
         company=row["company"],
         summary=row["summary"],
+        confidence=float(row["confidence"] or 0.0),
+        is_bulk=bool(row["is_bulk"]),
+        action_channel=row["action_channel"],
+        ai_source=row["ai_source"],
+        prompt_version=row["prompt_version"],
+        processing_version=row["processing_version"],
         scoring_breakdown=json.loads(row["scoring_breakdown"]),
     )
     return ProcessedEmail(
@@ -220,11 +305,16 @@ def _row_to_processed_email(row: sqlite3.Row) -> ProcessedEmail:
         cleaned_body=row["cleaned_body"],
         received_at=datetime.fromisoformat(row["received_at"]),
         unread=bool(row["unread"]),
+        gmail_message_id=row["gmail_message_id"],
+        gmail_thread_id=row["gmail_thread_id"],
+        content_fingerprint=row["content_fingerprint"],
+        last_processed_at=_from_iso(row["last_processed_at"]),
+        last_synced_at=_from_iso(row["last_synced_at"]),
         metadata=metadata,
     )
 
 
-def list_processed_emails(limit: int = 200) -> list[ProcessedEmail]:
+def list_processed_emails(limit: int = 5000) -> list[ProcessedEmail]:
     with _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM emails ORDER BY received_at DESC LIMIT ?", (limit,)
@@ -243,6 +333,20 @@ def get_email_vectors(limit: int = 2000) -> list[tuple[ProcessedEmail, list[floa
         vector = json.loads(row["embedding"])
         results.append((email, vector))
     return results
+
+
+def get_processed_email_record(external_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM emails WHERE external_id=?",
+            (external_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "email": _row_to_processed_email(row),
+        "embedding": json.loads(row["embedding"]),
+    }
 
 
 def list_top_important(limit: int) -> list[ProcessedEmail]:
@@ -306,6 +410,28 @@ def list_with_events(limit: int = 20) -> list[ProcessedEmail]:
             LIMIT ?
             """,
             (limit,),
+        ).fetchall()
+    return [_row_to_processed_email(row) for row in rows]
+
+
+def list_outdated_processed_emails(
+    *,
+    prompt_version: str,
+    processing_version: str,
+    limit: int = 200,
+) -> list[ProcessedEmail]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM emails
+            WHERE prompt_version != ?
+               OR processing_version != ?
+               OR ai_source != 'openai'
+               OR content_fingerprint IS NULL
+            ORDER BY last_processed_at ASC, received_at DESC
+            LIMIT ?
+            """,
+            (prompt_version, processing_version, limit),
         ).fetchall()
     return [_row_to_processed_email(row) for row in rows]
 
@@ -427,4 +553,94 @@ def get_google_oauth_token() -> dict[str, Any] | None:
 def clear_google_oauth_token() -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM google_oauth_token WHERE id=1")
+        conn.commit()
+
+
+def get_gmail_sync_cursor(scope_key: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            """
+            SELECT scope_key, next_page_token, is_complete, updated_at
+            FROM gmail_sync_cursor
+            WHERE scope_key=?
+            """,
+            (scope_key,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "scope_key": row["scope_key"],
+        "next_page_token": row["next_page_token"],
+        "is_complete": bool(row["is_complete"]),
+        "updated_at": _from_iso(row["updated_at"]),
+    }
+
+
+def upsert_gmail_sync_cursor(
+    *,
+    scope_key: str,
+    next_page_token: str | None,
+    is_complete: bool,
+) -> None:
+    now = _utc_now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO gmail_sync_cursor(scope_key, next_page_token, is_complete, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(scope_key) DO UPDATE SET
+                next_page_token=excluded.next_page_token,
+                is_complete=excluded.is_complete,
+                updated_at=excluded.updated_at
+            """,
+            (scope_key, next_page_token, int(is_complete), _to_iso(now)),
+        )
+        conn.commit()
+
+
+def delete_gmail_sync_cursor(scope_key: str | None = None) -> None:
+    with _connect() as conn:
+        if scope_key is None:
+            conn.execute("DELETE FROM gmail_sync_cursor")
+        else:
+            conn.execute(
+                "DELETE FROM gmail_sync_cursor WHERE scope_key=?",
+                (scope_key,),
+            )
+        conn.commit()
+
+
+def set_runtime_state(key: str, value: str | None) -> None:
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_runtime_state(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            (key, value, _to_iso(_utc_now())),
+        )
+        conn.commit()
+
+
+def get_runtime_state(key: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT key, value, updated_at FROM app_runtime_state WHERE key=?",
+            (key,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "key": row["key"],
+        "value": row["value"],
+        "updated_at": _from_iso(row["updated_at"]),
+    }
+
+
+def delete_runtime_state(key: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM app_runtime_state WHERE key=?", (key,))
         conn.commit()

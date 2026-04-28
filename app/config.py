@@ -112,7 +112,7 @@ class Settings:
     oauth_state_ttl_seconds: int = int(os.getenv("OAUTH_STATE_TTL_SECONDS", "600"))
     token_encryption_key: str | None = os.getenv("TOKEN_ENCRYPTION_KEY")
     allow_insecure_token_storage: bool = _as_bool(
-        os.getenv("ALLOW_INSECURE_TOKEN_STORAGE"), True
+        os.getenv("ALLOW_INSECURE_TOKEN_STORAGE"), False
     )
 
 

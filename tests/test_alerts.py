@@ -16,6 +16,7 @@ def _build_email(
     action_required: bool = False,
     deadline: datetime | None = None,
     unread: bool = True,
+    received_at: datetime | None = None,
 ) -> ProcessedEmail:
     return ProcessedEmail(
         id=int(eid.split("-")[-1]),
@@ -25,7 +26,7 @@ def _build_email(
         subject=subject,
         body=subject,
         cleaned_body=subject,
-        received_at=datetime.now(timezone.utc),
+        received_at=received_at or datetime.now(timezone.utc),
         unread=unread,
         metadata=ExtractedMetadata(
             category=category,  # type: ignore[arg-type]
@@ -110,3 +111,39 @@ def test_alerts_respect_highlight_deadlines_flag() -> None:
 
     assert all(not message.startswith("Deadline") for message in messages)
     assert any("Job action needed:" in message for message in messages)
+
+
+def test_alerts_skip_recruiter_stale_for_no_reply_link_notifications() -> None:
+    now = datetime.now(timezone.utc)
+    profile = UserProfile(
+        priorities=["jobs"],
+        important_senders=["recruiters"],
+        deprioritize=[],
+        highlight_deadlines=True,
+    )
+    stale_no_reply = _build_email(
+        eid="id-4",
+        subject="Interview update available",
+        from_email="no-reply@recruiting.company.com",
+        category="job",
+        importance=8.8,
+        action_required=True,
+        unread=True,
+        received_at=now - timedelta(days=6),
+    )
+    stale_no_reply.body = (
+        "Click to view your interview update: https://example.com/status "
+        "This mailbox is not monitored."
+    )
+    stale_no_reply.metadata.summary = stale_no_reply.body
+
+    alerts = generate_alerts(
+        profile=profile,
+        deadlines=[],
+        action_required=[stale_no_reply],
+        top_important=[stale_no_reply],
+        unread_important_count=1,
+    )
+    messages = [item.message.lower() for item in alerts]
+
+    assert all("no response to recruiter email" not in message for message in messages)

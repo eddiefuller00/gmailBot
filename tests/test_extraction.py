@@ -5,9 +5,15 @@ from datetime import datetime, timezone
 from app.extraction import (
     _apply_profile_constraints,
     _default_summary,
+    extract_metadata,
     parse_llm_extraction_payload,
 )
-from app.prompting import build_extraction_user_payload
+from app.prompting import (
+    EMAIL_EXTRACTION_PROMPT_VERSION,
+    PROCESSING_VERSION,
+    MAX_EXTRACTION_BODY_CHARS,
+    build_extraction_user_payload,
+)
 from app.schemas import EmailIngestItem, UserProfile
 
 
@@ -43,6 +49,9 @@ def test_parse_llm_extraction_payload_validates_schema() -> None:
             "event_date": None,
             "company": "Company",
             "summary": "Recruiter asks you to confirm your interview slot.",
+            "confidence": 0.97,
+            "is_bulk": False,
+            "action_channel": "reply",
         },
         email=email,
         cleaned_body=email.body,
@@ -52,6 +61,9 @@ def test_parse_llm_extraction_payload_validates_schema() -> None:
     assert parsed.action_required is True
     assert parsed.deadline is not None
     assert parsed.deadline.tzinfo is not None
+    assert parsed.confidence == 0.97
+    assert parsed.prompt_version == EMAIL_EXTRACTION_PROMPT_VERSION
+    assert parsed.processing_version == PROCESSING_VERSION
 
 
 def test_parse_llm_extraction_payload_rejects_invalid_category() -> None:
@@ -65,6 +77,9 @@ def test_parse_llm_extraction_payload_rejects_invalid_category() -> None:
             "event_date": None,
             "company": None,
             "summary": "summary",
+            "confidence": 0.2,
+            "is_bulk": True,
+            "action_channel": "none",
         },
         email=email,
         cleaned_body=email.body,
@@ -72,17 +87,31 @@ def test_parse_llm_extraction_payload_rejects_invalid_category() -> None:
     assert parsed is None
 
 
-def test_build_extraction_user_payload_contains_modular_blocks() -> None:
+def test_build_extraction_user_payload_contains_versions_and_examples() -> None:
     email = _sample_email()
     profile = UserProfile(priorities=["jobs"], important_senders=["recruiters"])
     payload = build_extraction_user_payload(email, email.body, profile)
 
+    assert payload["prompt_version"] == EMAIL_EXTRACTION_PROMPT_VERSION
+    assert payload["processing_version"] == PROCESSING_VERSION
     assert "rules" in payload
     assert "examples" in payload
     assert "output_schema" in payload
-    assert "profile_policy" in payload
     assert payload["profile_policy"]["priority_categories"] == ["job"]
-    assert payload["email"]["subject"] == "Interview scheduling"
+
+
+def test_build_extraction_user_payload_truncates_long_body() -> None:
+    email = _sample_email()
+    profile = UserProfile(priorities=["jobs"])
+    long_body = ("A" * 3500) + "\n\n" + ("B" * 1800)
+
+    payload = build_extraction_user_payload(email, long_body, profile)
+
+    body = payload["email"]["body"]
+    assert len(body) <= MAX_EXTRACTION_BODY_CHARS + 10
+    assert body.startswith("A" * 2800)
+    assert body.endswith("B" * 1000)
+    assert " ... " in body
 
 
 def test_profile_constraints_reclassify_marketing_job_false_positive() -> None:
@@ -111,6 +140,9 @@ def test_profile_constraints_reclassify_marketing_job_false_positive() -> None:
             "event_date": None,
             "company": "Yankees",
             "summary": "Marketing promo.",
+            "confidence": 0.61,
+            "is_bulk": True,
+            "action_channel": "portal",
         },
         email=email,
         cleaned_body=email.body,
@@ -125,4 +157,49 @@ def test_profile_constraints_reclassify_marketing_job_false_positive() -> None:
     )
     assert adjusted.category == "promotion"
     assert adjusted.action_required is False
+    assert adjusted.action_channel == "none"
     assert adjusted.deadline is None
+
+
+def test_extract_metadata_heuristic_path_marks_portal_and_bulk_signals() -> None:
+    email = EmailIngestItem(
+        external_id="e-3",
+        from_email="no-reply@jobs.example.com",
+        from_name="Updates Bot",
+        subject="Application update available",
+        body=(
+            "Review the next step in your application here: https://example.com/app/123 "
+            "This mailbox is not monitored."
+        ),
+        received_at=datetime(2026, 4, 14, 12, 0, tzinfo=timezone.utc),
+        unread=True,
+    )
+    profile = UserProfile(priorities=["jobs"])
+
+    metadata = extract_metadata(email, email.body, profile, allow_fallback=True)
+
+    assert metadata.action_required is True
+    assert metadata.action_channel == "portal"
+    assert metadata.ai_source == "heuristic"
+
+
+def test_extract_metadata_reclassifies_job_digest_as_newsletter() -> None:
+    email = EmailIngestItem(
+        external_id="e-4",
+        from_email="emails@emails.efinancialcareers.com",
+        from_name="eFinancialCareers",
+        subject="The latest jobs picked for you!",
+        body=(
+            "View all jobs. You received this email because you have an account. "
+            "Unsubscribe and manage your preferences."
+        ),
+        received_at=datetime(2026, 4, 14, 12, 0, tzinfo=timezone.utc),
+        unread=True,
+    )
+    profile = UserProfile(priorities=["jobs"], deprioritize=["newsletters"])
+
+    metadata = extract_metadata(email, email.body, profile, allow_fallback=True)
+
+    assert metadata.category == "newsletter"
+    assert metadata.action_required is False
+    assert metadata.is_bulk is True

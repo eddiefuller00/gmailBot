@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 Category = Literal[
     "job", "school", "bill", "event", "promotion", "newsletter", "personal", "other"
 ]
+ActionChannel = Literal["reply", "portal", "read", "none"]
+AISource = Literal["openai", "heuristic"]
 
 
 class UserProfile(BaseModel):
@@ -39,6 +41,12 @@ class ExtractedMetadata(BaseModel):
     event_date: datetime | None = None
     company: str | None = None
     summary: str = ""
+    confidence: float = 0.0
+    is_bulk: bool = False
+    action_channel: ActionChannel = "none"
+    ai_source: AISource = "openai"
+    prompt_version: str = ""
+    processing_version: str = ""
     scoring_breakdown: dict[str, float] = Field(default_factory=dict)
 
 
@@ -52,6 +60,11 @@ class ProcessedEmail(BaseModel):
     cleaned_body: str
     received_at: datetime
     unread: bool
+    gmail_message_id: str | None = None
+    gmail_thread_id: str | None = None
+    content_fingerprint: str | None = None
+    last_processed_at: datetime | None = None
+    last_synced_at: datetime | None = None
     metadata: ExtractedMetadata
 
 
@@ -78,6 +91,8 @@ class QARequest(BaseModel):
 
 class QAResponse(BaseModel):
     answer: str
+    answer_mode: Literal["openai_rag"] = "openai_rag"
+    citations: list[str] = Field(default_factory=list)
     supporting_emails: list[ProcessedEmail]
 
 
@@ -88,6 +103,23 @@ class AlertItem(BaseModel):
 
 class AlertsResponse(BaseModel):
     alerts: list[AlertItem]
+
+
+class CapabilityStatus(BaseModel):
+    configured: bool
+    available: bool
+    message: str = ""
+
+
+class CapabilitiesResponse(BaseModel):
+    openai: CapabilityStatus
+    gmail_oauth: CapabilityStatus
+    token_encryption: CapabilityStatus
+    can_rank_inbox: bool
+    can_sync_gmail: bool
+    last_successful_sync_at: datetime | None = None
+    last_ai_error: str | None = None
+    last_ai_error_at: datetime | None = None
 
 
 class GoogleConnectResponse(BaseModel):
@@ -134,4 +166,3 @@ class GmailMessageDetail(BaseModel):
     body_text: str = ""
     label_ids: list[str] = Field(default_factory=list)
     is_unread: bool = False
-

@@ -4,13 +4,14 @@ import math
 import re
 from typing import Sequence
 
+from app.ai_runtime import clear_ai_error, get_openai_client, raise_ai_processing_error
 from app.config import settings
 from app.schemas import ProcessedEmail
 
-try:
-    from openai import OpenAI
-except Exception:  # pragma: no cover - runtime optional
-    OpenAI = None  # type: ignore[assignment]
+
+EMBEDDING_MAX_CHARS = 10000
+EMBEDDING_HEAD_CHARS = 6000
+EMBEDDING_TAIL_CHARS = 3500
 
 
 def _normalize(vector: list[float]) -> list[float]:
@@ -20,26 +21,27 @@ def _normalize(vector: list[float]) -> list[float]:
     return [x / norm for x in vector]
 
 
-def _hashed_embedding(text: str, dims: int = 256) -> list[float]:
-    vector = [0.0] * dims
-    for token in re.findall(r"[a-zA-Z0-9_]+", text.lower()):
-        idx = hash(token) % dims
-        vector[idx] += 1.0
-    return _normalize(vector)
+def _prepare_embedding_input(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if len(normalized) <= EMBEDDING_MAX_CHARS:
+        return normalized
+
+    head = normalized[:EMBEDDING_HEAD_CHARS].rstrip()
+    tail = normalized[-EMBEDDING_TAIL_CHARS :].lstrip()
+    return f"{head} ... {tail}"
 
 
 def embed_text(text: str) -> list[float]:
-    if settings.openai_api_key and OpenAI is not None:
-        try:
-            client = OpenAI(api_key=settings.openai_api_key)
-            result = client.embeddings.create(
-                model=settings.openai_embedding_model,
-                input=text,
-            )
-            return _normalize([float(x) for x in result.data[0].embedding])
-        except Exception:
-            pass
-    return _hashed_embedding(text)
+    try:
+        client = get_openai_client()
+        result = client.embeddings.create(
+            model=settings.openai_embedding_model,
+            input=_prepare_embedding_input(text),
+        )
+        clear_ai_error()
+        return _normalize([float(x) for x in result.data[0].embedding])
+    except Exception as exc:
+        raise_ai_processing_error("embedding", exc)
 
 
 def cosine_similarity(v1: Sequence[float], v2: Sequence[float]) -> float:
@@ -60,4 +62,3 @@ def semantic_rank(
     ]
     scored.sort(key=lambda item: item[1], reverse=True)
     return [item[0] for item in scored[:limit]]
-

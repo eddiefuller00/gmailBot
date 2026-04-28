@@ -24,14 +24,35 @@ function buildEmail(id: number, subject: string): ProcessedEmail {
       event_date: null,
       company: "Company",
       summary: "Interview request",
+      confidence: 0.96,
+      is_bulk: false,
+      action_channel: "reply",
+      ai_source: "openai",
+      prompt_version: "email-extraction-v2",
+      processing_version: "processing-v2",
       scoring_breakdown: {}
-    }
+    },
+    gmail_message_id: "msg-1",
+    gmail_thread_id: "thread-1",
+    content_fingerprint: "fingerprint",
+    last_processed_at: "2026-04-13T14:00:00Z",
+    last_synced_at: "2026-04-13T14:00:00Z"
   };
 }
 
 describe("DashboardPage", () => {
   it("renders returned dashboard data", async () => {
     const api = {
+      getCapabilities: vi.fn().mockResolvedValue({
+        openai: { configured: true, available: true, message: "OpenAI ready" },
+        gmail_oauth: { configured: true, available: true, message: "OAuth ready" },
+        token_encryption: { configured: true, available: true, message: "Encryption ready" },
+        can_rank_inbox: true,
+        can_sync_gmail: false,
+        last_successful_sync_at: null,
+        last_ai_error: null,
+        last_ai_error_at: null
+      }),
       getProfile: vi.fn(),
       saveProfile: vi.fn(),
       getDashboard: vi.fn().mockResolvedValue({
