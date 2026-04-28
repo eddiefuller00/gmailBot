@@ -2,11 +2,12 @@ import type { AlertItem } from "../api/types";
 
 interface AlertListProps {
   alerts: AlertItem[];
+  className?: string;
 }
 
-export function AlertList({ alerts }: AlertListProps) {
+export function AlertList({ alerts, className }: AlertListProps) {
   return (
-    <section className="panel">
+    <section className={`panel ${className ?? ""}`.trim()}>
       <header className="panel-header">
         <h3>Smart Alerts</h3>
         <span className="pill">{alerts.length}</span>

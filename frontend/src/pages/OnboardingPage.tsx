@@ -116,6 +116,7 @@ export function OnboardingPage({ api = apiClient }: OnboardingPageProps) {
   return (
     <section className="page">
       <header className="page-header">
+        <span className="section-kicker">Personalization</span>
         <h2>Onboarding</h2>
         <p>Set what matters so the copilot ranks email based on your context.</p>
       </header>

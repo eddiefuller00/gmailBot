@@ -2,10 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { apiClient, type ApiClient } from "../api/client";
 import type {
+  CapabilitiesResponse,
   GmailMessageDetail,
   GmailMessageSummary,
   GoogleConnectionStatus
 } from "../api/types";
+import { CapabilityBanner } from "../components/CapabilityBanner";
 
 interface GmailPageProps {
   api?: ApiClient;
@@ -50,6 +52,7 @@ function mergeMessagePages(
 }
 
 export function GmailPage({ api = apiClient }: GmailPageProps) {
+  const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);
   const [connection, setConnection] = useState<GoogleConnectionStatus | null>(null);
   const [messages, setMessages] = useState<GmailMessageSummary[]>([]);
   const [selectedMessage, setSelectedMessage] = useState<GmailMessageDetail | null>(null);
@@ -71,8 +74,12 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
   const loadConnection = useCallback(async () => {
     setLoadingConnection(true);
     try {
-      const status = await api.getGoogleConnection();
+      const [status, capabilityData] = await Promise.all([
+        api.getGoogleConnection(),
+        api.getCapabilities()
+      ]);
       setConnection(status);
+      setCapabilities(capabilityData);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load Gmail connection.");
     } finally {
@@ -243,7 +250,7 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
     return <p className="status">Loading Gmail connection...</p>;
   }
 
-  if (!connection) {
+  if (!connection || !capabilities) {
     return <p className="error">Failed to load Gmail connection state.</p>;
   }
 
@@ -251,25 +258,32 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
     return (
       <section className="page">
         <header className="page-header">
+          <span className="section-kicker">Connection</span>
           <h2>Gmail</h2>
-          <p>Configure Google OAuth variables in `.env` before connecting Gmail.</p>
+          <p>Configure Google OAuth before connecting Gmail.</p>
         </header>
-        <p className="error">
-          Missing `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, or `GOOGLE_REDIRECT_URI`.
-        </p>
+        <CapabilityBanner capabilities={capabilities} />
       </section>
     );
   }
 
   if (!connection.connected) {
+    const canConnectGmail = capabilities.gmail_oauth.available && capabilities.token_encryption.available;
+
     return (
       <section className="page">
         <header className="page-header">
+          <span className="section-kicker">Connection</span>
           <h2>Gmail</h2>
-          <p>Connect your Gmail account to list inbox messages.</p>
+          <p>Connect Gmail only after OAuth and encrypted token storage are ready.</p>
         </header>
+        <CapabilityBanner capabilities={capabilities} />
         {error ? <p className="error">{error}</p> : null}
-        <button type="button" onClick={handleConnect} disabled={connecting}>
+        <button
+          type="button"
+          onClick={handleConnect}
+          disabled={connecting || !canConnectGmail}
+        >
           {connecting ? "Opening Google..." : "Connect Gmail"}
         </button>
       </section>
@@ -280,6 +294,7 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
     <section className="page">
       <header className="page-header with-action">
         <div>
+          <span className="section-kicker">Connected inbox</span>
           <h2>Gmail Inbox</h2>
           <p>
             Connected as <strong>{connection.email ?? "unknown account"}</strong>
@@ -290,11 +305,7 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
         </button>
       </header>
 
-      {connection.insecure_storage ? (
-        <p className="warning">
-          Refresh token is stored without encryption. Set `TOKEN_ENCRYPTION_KEY` in `.env`.
-        </p>
-      ) : null}
+      <CapabilityBanner capabilities={capabilities} />
       {error ? <p className="error">{error}</p> : null}
 
       <form className="ask-form" onSubmit={handleSearch} aria-label="Gmail Search Form">
@@ -362,29 +373,28 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
                 <div ref={loadMoreRef} className="scroll-sentinel" aria-hidden="true" />
               </div>
             ) : null}
-            {!loadingMessages && !loadingMore && !nextPageToken && messages.length > 0 ? (
-              <p className="status">All available messages are loaded.</p>
-            ) : null}
           </div>
         </section>
 
         <section className="panel">
           <header className="panel-header">
             <h3>Message Detail</h3>
+            {selectedMessage ? <span className="pill">{selectedMessage.is_unread ? "unread" : "read"}</span> : null}
           </header>
           {loadingDetail ? <p className="status">Loading message...</p> : null}
           {!loadingDetail && !selectedMessage ? (
-            <p className="empty">Select a message to view full content.</p>
+            <p className="empty">Open a message to inspect subject, sender, and body.</p>
           ) : null}
           {selectedMessage ? (
-            <article className="detail-block">
-              <h4>{selectedMessage.subject || "(No Subject)"}</h4>
+            <article className="email-card">
+              <div className="email-top-row">
+                <h4>{selectedMessage.subject || "(No Subject)"}</h4>
+                <span className="tag">{formatDate(selectedMessage.received_at)}</span>
+              </div>
               <p className="meta">
-                From: {selectedMessage.from_name || selectedMessage.from_email || "Unknown"}
+                {selectedMessage.from_name || selectedMessage.from_email || "Unknown sender"}
               </p>
-              <p className="meta">To: {selectedMessage.to_email || "Unknown"}</p>
-              <p className="meta">Received: {formatDate(selectedMessage.received_at)}</p>
-              <pre>{selectedMessage.body_text || selectedMessage.snippet || "(No body text)"}</pre>
+              <p className="summary">{selectedMessage.body_text || selectedMessage.snippet || "(No content)"}</p>
             </article>
           ) : null}
         </section>

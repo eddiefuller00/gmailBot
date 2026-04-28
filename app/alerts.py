@@ -187,6 +187,7 @@ def generate_alerts(
             priority_categories=priority_categories,
             deprioritize_categories=deprioritize_categories,
         )
+        and email.metadata.action_channel == "reply"
         and (now - email.received_at.replace(tzinfo=email.received_at.tzinfo or timezone.utc))
         >= timedelta(days=5)
     ]

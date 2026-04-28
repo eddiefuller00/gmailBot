@@ -1,5 +1,6 @@
 import type {
   AlertsResponse,
+  CapabilitiesResponse,
   DashboardResponse,
   EmailIngestItem,
   GmailMessageDetail,
@@ -31,6 +32,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export interface ApiClient {
+  getCapabilities: () => Promise<CapabilitiesResponse>;
   getProfile: () => Promise<UserProfile>;
   saveProfile: (profile: UserProfile) => Promise<UserProfile>;
   getDashboard: (topN?: number) => Promise<DashboardResponse>;
@@ -45,6 +47,8 @@ export interface ApiClient {
     q?: string;
     labelIds?: string[];
     clearNonGmail?: boolean;
+    backfill?: boolean;
+    resetBackfill?: boolean;
   }) => Promise<IngestResponse>;
   listGmailMessages: (options?: {
     maxResults?: number;
@@ -56,6 +60,7 @@ export interface ApiClient {
 }
 
 export const apiClient: ApiClient = {
+  getCapabilities: () => request<CapabilitiesResponse>("/capabilities"),
   getProfile: () => request<UserProfile>("/profile"),
   saveProfile: (profile) =>
     request<UserProfile>("/profile", {
@@ -88,6 +93,12 @@ export const apiClient: ApiClient = {
     }
     if (options.clearNonGmail) {
       params.set("clear_non_gmail", "true");
+    }
+    if (options.backfill) {
+      params.set("backfill", "true");
+    }
+    if (options.resetBackfill) {
+      params.set("reset_backfill", "true");
     }
     for (const labelId of options.labelIds ?? ["INBOX"]) {
       params.append("label_ids", labelId);

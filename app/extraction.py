@@ -8,18 +8,25 @@ from typing import Any
 from dateutil import parser as date_parser
 from pydantic import BaseModel, ValidationError
 
+from app.ai_runtime import clear_ai_error, get_openai_client, raise_ai_processing_error
 from app.config import settings
 from app.profile_preferences import (
     profile_deprioritize_categories,
     profile_priority_categories,
 )
-from app.prompting import EMAIL_EXTRACTION_SYSTEM_PROMPT, build_extraction_user_payload
-from app.schemas import Category, EmailIngestItem, ExtractedMetadata, UserProfile
-
-try:
-    from openai import OpenAI
-except Exception:  # pragma: no cover - runtime optional
-    OpenAI = None  # type: ignore[assignment]
+from app.prompting import (
+    EMAIL_EXTRACTION_PROMPT_VERSION,
+    EMAIL_EXTRACTION_SYSTEM_PROMPT,
+    PROCESSING_VERSION,
+    build_extraction_user_payload,
+)
+from app.response_intent import (
+    ResponseIntentSignals,
+    derive_action_channel,
+    detect_response_intent,
+    is_no_reply_sender,
+)
+from app.schemas import ActionChannel, Category, EmailIngestItem, ExtractedMetadata, UserProfile
 
 
 CATEGORY_KEYWORDS: dict[str, list[str]] = {
@@ -30,7 +37,6 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
         "offer",
         "internship",
         "hiring",
-        "candidate",
         "assessment",
     ],
     "school": [
@@ -38,9 +44,11 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
         "course",
         "professor",
         "campus",
-        "class",
         "syllabus",
         "exam",
+        "homework",
+        "tuition",
+        "registrar",
     ],
     "bill": [
         "invoice",
@@ -54,6 +62,7 @@ CATEGORY_KEYWORDS: dict[str, list[str]] = {
     "event": ["event", "webinar", "meeting", "calendar", "workshop", "invite"],
     "promotion": ["sale", "discount", "offer ends", "promo", "coupon"],
     "newsletter": ["newsletter", "weekly digest", "roundup", "update"],
+    "personal": ["dad", "mom", "friend", "family", "dinner", "weekend"],
 }
 
 ACTION_KEYWORDS = [
@@ -65,6 +74,8 @@ ACTION_KEYWORDS = [
     "action required",
     "register",
     "schedule",
+    "log in",
+    "review",
 ]
 
 MARKETING_TERMS = [
@@ -79,7 +90,6 @@ MARKETING_TERMS = [
     "unsubscribe",
     "view online",
     "% off",
-    "season tickets",
 ]
 
 NEWSLETTER_TERMS = [
@@ -87,36 +97,61 @@ NEWSLETTER_TERMS = [
     "digest",
     "roundup",
     "weekly update",
-    "you are invited",
-    "learn how to",
+    "weekly digest",
     "jobs picked for you",
     "recommended for you",
+    "view all jobs",
+    "you received this email because",
+    "manage your preferences",
 ]
 
-STRONG_JOB_TERMS = [
+JOB_CONTEXT_TERMS = [
     "interview",
-    "application status",
-    "hiring manager",
+    "application",
     "recruiter",
+    "hiring manager",
     "talent team",
-    "candidate",
+    "talent acquisition",
     "assessment",
     "offer letter",
-    "next steps",
-    "confirm your interview",
+    "resume",
+    "cv",
 ]
 
-GENERIC_JOB_MARKETING_TERMS = [
-    "job market",
-    "career tips",
-    "land a job",
-    "jobs picked for you",
-    "recommended jobs",
+SCHOOL_CONTEXT_TERMS = [
+    "school",
+    "college",
+    "university",
+    "course",
+    "professor",
+    "campus",
+    "syllabus",
+    "homework",
+    "assignment",
+    "registrar",
+    "tuition",
+]
+
+BILL_CONTEXT_TERMS = [
+    "invoice",
+    "payment due",
+    "balance due",
+    "amount due",
+    "statement available",
+    "autopay",
+    "past due",
+    "charged",
+    "receipt",
 ]
 
 BULK_SENDER_TERMS = [
     "noreply",
     "no-reply",
+    "alerts",
+    "notifications",
+    "updates",
+    "digest",
+    "emails",
     "newsletter",
     "marketing",
     "promo",
@@ -129,7 +164,7 @@ DEADLINE_MARKERS = [
 ]
 
 EVENT_MARKERS = [
-    r"(?:interview|meeting|event|webinar)\s*(?:on|at)?\s*([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?(?:\s+\d{1,2}:\d{2}\s*(?:am|pm))?)",
+    r"(?:interview|meeting|event|webinar|office hours|dinner)\s*(?:on|at)?\s*([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*\d{4})?(?:\s+\d{1,2}:\d{2}\s*(?:am|pm))?)",
     r"(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2})",
 ]
 
@@ -143,18 +178,24 @@ def _default_summary(subject: str, body: str) -> str:
     return f"{subject}: {head}" if subject else head
 
 
+def _matches_term(lower_text: str, term: str) -> bool:
+    normalized = term.lower().strip()
+    if not normalized:
+        return False
+    if re.search(r"[a-z0-9]", normalized) and " " not in normalized:
+        pattern = rf"\b{re.escape(normalized)}\b"
+        return bool(re.search(pattern, lower_text))
+    return normalized in lower_text
+
+
 def _contains_any(text: str, terms: list[str]) -> bool:
     lower = text.lower()
-    return any(term in lower for term in terms)
+    return any(_matches_term(lower, term) for term in terms)
 
 
-def _pick_category(text: str) -> str:
+def _count_any(text: str, terms: list[str]) -> int:
     lower = text.lower()
-    scores: dict[str, int] = {}
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        scores[category] = sum(1 for keyword in keywords if keyword in lower)
-    best = max(scores.items(), key=lambda kv: kv[1])
-    return best[0] if best[1] > 0 else "other"
+    return sum(1 for term in terms if _matches_term(lower, term))
 
 
 def _extract_datetime(text: str, markers: list[str]) -> datetime | None:
@@ -163,11 +204,11 @@ def _extract_datetime(text: str, markers: list[str]) -> datetime | None:
             candidate = match.group(1).strip()
             try:
                 parsed = date_parser.parse(candidate, fuzzy=True)
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                return parsed
             except Exception:
                 continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
     return None
 
 
@@ -187,22 +228,38 @@ def _extract_company(from_email: str, subject: str, body: str) -> str | None:
 
 def _is_bulk_sender(from_email: str) -> bool:
     lower = from_email.lower()
-    return any(term in lower for term in BULK_SENDER_TERMS)
+    return is_no_reply_sender(from_email) or any(term in lower for term in BULK_SENDER_TERMS)
 
 
-def _has_strong_job_signal(text: str, from_email: str) -> bool:
-    if _contains_any(text, STRONG_JOB_TERMS):
+def _append_reason(reason: str, message: str) -> str:
+    base = reason.strip()
+    if not base:
+        return message
+    if message.lower() in base.lower():
+        return base
+    return f"{base}; {message}"
+
+
+def _pick_category(text: str) -> Category:
+    lower = text.lower()
+    scores: dict[str, int] = {}
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        scores[category] = sum(1 for keyword in keywords if _matches_term(lower, keyword))
+    if scores.get("school", 0) > 0 and not _contains_any(lower, SCHOOL_CONTEXT_TERMS):
+        scores["school"] = 0
+    if scores.get("bill", 0) > 0 and not _contains_any(lower, BILL_CONTEXT_TERMS):
+        scores["bill"] = max(0, scores["bill"] - 1)
+    best = max(scores.items(), key=lambda kv: kv[1])
+    return best[0] if best[1] > 0 else "other"  # type: ignore[return-value]
+
+
+def _strong_job_signal(text: str, from_email: str) -> bool:
+    lower = text.lower()
+    if _contains_any(lower, JOB_CONTEXT_TERMS):
         return True
-    lower = from_email.lower()
-    if "recruit" in lower or "talent" in lower:
-        return not _is_bulk_sender(from_email)
-    return False
-
-
-def _choose_marketing_category(text: str, from_email: str) -> Category:
-    if _contains_any(text, NEWSLETTER_TERMS) or "newsletter" in from_email.lower():
-        return "newsletter"
-    return "promotion"
+    return ("recruit" in from_email.lower() or "talent" in from_email.lower()) and not _is_bulk_sender(
+        from_email
+    )
 
 
 def _apply_profile_constraints(
@@ -216,70 +273,131 @@ def _apply_profile_constraints(
     text = f"{email.subject}\n{cleaned_body}".lower()
     priority_categories = profile_priority_categories(profile)
     deprioritized_categories = profile_deprioritize_categories(profile)
-    bulk_sender = _is_bulk_sender(email.from_email)
-    marketing_like = _contains_any(text, MARKETING_TERMS) or bulk_sender
+    strong_job_signal = _strong_job_signal(text, email.from_email)
+    marketing_like = _contains_any(text, MARKETING_TERMS)
     newsletter_like = _contains_any(text, NEWSLETTER_TERMS)
-    strong_job_signal = _has_strong_job_signal(text, email.from_email)
-    generic_job_marketing = _contains_any(text, GENERIC_JOB_MARKETING_TERMS)
+    school_context = _contains_any(text, SCHOOL_CONTEXT_TERMS)
+    bill_context = _contains_any(text, BILL_CONTEXT_TERMS)
 
-    if (
-        adjusted.category == "job"
-        and not strong_job_signal
-        and (marketing_like or newsletter_like or generic_job_marketing)
-    ):
-        adjusted.category = _choose_marketing_category(text, email.from_email)
+    if adjusted.category == "job" and not strong_job_signal and (marketing_like or newsletter_like):
+        adjusted.category = "newsletter" if newsletter_like else "promotion"
         adjusted.action_required = False
+        adjusted.action_channel = "none"
         adjusted.deadline = None
         adjusted.event_date = None
-        adjusted.reason = (
-            f"{adjusted.reason}; reclassified as {adjusted.category} due to marketing/newsletter signals"
-        ).strip("; ")
+        adjusted.is_bulk = True
+        adjusted.reason = _append_reason(
+            adjusted.reason,
+            f"Reclassified as {adjusted.category} because this looks automated rather than candidacy-specific",
+        )
+
+    if adjusted.category == "school" and not school_context and (marketing_like or newsletter_like):
+        adjusted.category = "promotion" if marketing_like else "newsletter"
+        adjusted.action_required = False
+        adjusted.action_channel = "none"
+        adjusted.deadline = None
+        adjusted.event_date = None
+        adjusted.is_bulk = True
+        adjusted.reason = _append_reason(
+            adjusted.reason,
+            "Reclassified because there is no direct academic context",
+        )
+
+    if adjusted.category == "bill" and not bill_context and newsletter_like:
+        adjusted.category = "newsletter"
+        adjusted.action_required = False
+        adjusted.action_channel = "none"
+        adjusted.deadline = None
+        adjusted.event_date = None
+        adjusted.is_bulk = True
+        adjusted.reason = _append_reason(
+            adjusted.reason,
+            "Reclassified because this is a digest rather than a billing workflow",
+        )
+
+    if adjusted.category in {"promotion", "newsletter"} and adjusted.category in deprioritized_categories:
+        adjusted.reason = _append_reason(adjusted.reason, "Matches the user's deprioritized categories")
+
+    if adjusted.category in priority_categories and not adjusted.action_required and adjusted.action_channel == "none":
+        adjusted.action_channel = "read"
+
+    return adjusted
+
+
+def _apply_response_intent_signals(
+    *,
+    email: EmailIngestItem,
+    cleaned_body: str,
+    metadata: ExtractedMetadata,
+) -> ExtractedMetadata:
+    adjusted = metadata.model_copy(deep=True)
+    signals = detect_response_intent(
+        from_email=email.from_email,
+        subject=email.subject,
+        body=cleaned_body,
+    )
+
+    adjusted.is_bulk = adjusted.is_bulk or _is_bulk_sender(email.from_email)
+    adjusted.action_channel = derive_action_channel(
+        action_required=adjusted.action_required,
+        signals=signals,
+    )
+
+    if signals.no_reply_sender:
+        adjusted.reason = _append_reason(adjusted.reason, "Sender appears to be automated or no-reply")
+    if signals.link_only_cta and adjusted.action_channel == "portal":
+        adjusted.reason = _append_reason(adjusted.reason, "Action is likely completed through a portal or link")
+    if signals.likely_needs_reply:
+        adjusted.reason = _append_reason(adjusted.reason, "Direct reply requested")
 
     if adjusted.category in {"promotion", "newsletter"}:
         adjusted.action_required = False
-        if adjusted.category in deprioritized_categories:
-            adjusted.deadline = None
-            adjusted.event_date = None
-
-    if (
-        adjusted.category not in priority_categories
-        and adjusted.category in deprioritized_categories
-        and (marketing_like or newsletter_like)
-    ):
-        adjusted.reason = (
-            f"{adjusted.reason}; deprioritized by onboarding preferences"
-        ).strip("; ")
+        adjusted.action_channel = "none"
+        adjusted.is_bulk = True
 
     return adjusted
 
 
 def _heuristic_extract(email: EmailIngestItem, cleaned_body: str) -> ExtractedMetadata:
     text = f"{email.subject}\n{cleaned_body}"
-    category = _pick_category(text)
+    signals = detect_response_intent(
+        from_email=email.from_email,
+        subject=email.subject,
+        body=cleaned_body,
+    )
     action_required = any(token in text.lower() for token in ACTION_KEYWORDS)
+    if action_required and not signals.likely_needs_reply and (
+        signals.no_reply_sender or signals.link_only_cta
+    ):
+        action_required = True
+
+    is_bulk = _is_bulk_sender(email.from_email) or _contains_any(text, NEWSLETTER_TERMS + MARKETING_TERMS)
+    category = _pick_category(text)
+    if is_bulk and category in {"job", "school", "bill", "other"} and not _strong_job_signal(text, email.from_email):
+        if _contains_any(text, NEWSLETTER_TERMS):
+            category = "newsletter"
+        elif _contains_any(text, MARKETING_TERMS):
+            category = "promotion"
+
     deadline = _extract_datetime(text, DEADLINE_MARKERS)
     event_date = _extract_datetime(text, EVENT_MARKERS)
     company = _extract_company(email.from_email, email.subject, cleaned_body)
-
-    reason_parts = []
-    if category != "other":
-        reason_parts.append(f"Matched {category} signals")
-    if action_required:
-        reason_parts.append("Contains action-oriented language")
-    if deadline:
-        reason_parts.append("Includes a deadline")
-    if event_date:
-        reason_parts.append("Includes an event date")
-    reason = "; ".join(reason_parts) if reason_parts else "General informational email"
+    reason = "Heuristic extraction used for a controlled test path."
 
     return ExtractedMetadata(
-        category=category,  # type: ignore[arg-type]
+        category=category,
         reason=reason,
         action_required=action_required,
         deadline=deadline,
         event_date=event_date,
         company=company,
         summary=_default_summary(email.subject, cleaned_body),
+        confidence=0.55 if not is_bulk else 0.7,
+        is_bulk=is_bulk,
+        action_channel=derive_action_channel(action_required=action_required, signals=signals),
+        ai_source="heuristic",
+        prompt_version=EMAIL_EXTRACTION_PROMPT_VERSION,
+        processing_version=PROCESSING_VERSION,
     )
 
 
@@ -291,6 +409,9 @@ class LLMExtractionPayload(BaseModel):
     event_date: str | None = None
     company: str | None = None
     summary: str = ""
+    confidence: float = 0.0
+    is_bulk: bool = False
+    action_channel: ActionChannel = "none"
 
 
 def _parse_optional_datetime(value: str | None) -> datetime | None:
@@ -316,51 +437,44 @@ def parse_llm_extraction_payload(
     except ValidationError:
         return None
 
-    deadline = _parse_optional_datetime(parsed.deadline)
-    event_date = _parse_optional_datetime(parsed.event_date)
-    summary = parsed.summary.strip() or _default_summary(email.subject, cleaned_body)
-    reason = parsed.reason.strip() or "LLM extraction"
-    company = parsed.company.strip() if isinstance(parsed.company, str) else None
-
     return ExtractedMetadata(
         category=parsed.category,
-        reason=reason,
+        reason=parsed.reason.strip() or "OpenAI extraction",
         action_required=parsed.action_required,
-        deadline=deadline,
-        event_date=event_date,
-        company=company or None,
-        summary=summary,
+        deadline=_parse_optional_datetime(parsed.deadline),
+        event_date=_parse_optional_datetime(parsed.event_date),
+        company=parsed.company.strip() if isinstance(parsed.company, str) and parsed.company.strip() else None,
+        summary=parsed.summary.strip() or _default_summary(email.subject, cleaned_body),
+        confidence=max(0.0, min(1.0, float(parsed.confidence))),
+        is_bulk=parsed.is_bulk,
+        action_channel=parsed.action_channel,
+        ai_source="openai",
+        prompt_version=EMAIL_EXTRACTION_PROMPT_VERSION,
+        processing_version=PROCESSING_VERSION,
     )
 
 
 def _llm_extract(
-    email: EmailIngestItem, cleaned_body: str, profile: UserProfile
-) -> ExtractedMetadata | None:
-    if not settings.openai_api_key or OpenAI is None:
-        return None
-
+    email: EmailIngestItem,
+    cleaned_body: str,
+    profile: UserProfile,
+) -> ExtractedMetadata:
     try:
-        client = OpenAI(api_key=settings.openai_api_key)
+        client = get_openai_client()
         user_payload = build_extraction_user_payload(email, cleaned_body, profile)
-        request_params: dict[str, Any] = {
-            "model": settings.openai_chat_model,
-            "temperature": settings.openai_chat_temperature,
-            "top_p": settings.openai_chat_top_p,
-            "frequency_penalty": settings.openai_chat_frequency_penalty,
-            "presence_penalty": settings.openai_chat_presence_penalty,
-            "max_tokens": settings.openai_chat_max_tokens,
-            "response_format": {"type": "json_object"},
-            "messages": [
+        completion = client.chat.completions.create(
+            model=settings.openai_chat_model,
+            temperature=settings.openai_chat_temperature,
+            top_p=settings.openai_chat_top_p,
+            frequency_penalty=settings.openai_chat_frequency_penalty,
+            presence_penalty=settings.openai_chat_presence_penalty,
+            max_completion_tokens=max(700, settings.openai_chat_max_tokens),
+            response_format={"type": "json_object"},
+            messages=[
                 {"role": "system", "content": EMAIL_EXTRACTION_SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(user_payload)},
             ],
-        }
-        if settings.openai_chat_seed is not None:
-            request_params["seed"] = settings.openai_chat_seed
-        if settings.openai_chat_stop_sequences:
-            request_params["stop"] = list(settings.openai_chat_stop_sequences)
-
-        completion = client.chat.completions.create(**request_params)
+        )
         raw = completion.choices[0].message.content or "{}"
         data: dict[str, Any] = json.loads(raw)
         parsed = parse_llm_extraction_payload(
@@ -369,20 +483,29 @@ def _llm_extract(
             cleaned_body=cleaned_body,
         )
         if parsed is None:
-            return None
+            raise ValueError("OpenAI returned an invalid extraction payload.")
+        clear_ai_error()
         return parsed
-    except Exception:
-        return None
+    except Exception as exc:
+        raise_ai_processing_error("extraction", exc)
 
 
 def extract_metadata(
-    email: EmailIngestItem, cleaned_body: str, profile: UserProfile
+    email: EmailIngestItem,
+    cleaned_body: str,
+    profile: UserProfile,
+    *,
+    allow_fallback: bool = False,
 ) -> ExtractedMetadata:
-    llm = _llm_extract(email, cleaned_body, profile)
-    base = llm if llm is not None else _heuristic_extract(email, cleaned_body)
-    return _apply_profile_constraints(
+    base = _heuristic_extract(email, cleaned_body) if allow_fallback else _llm_extract(email, cleaned_body, profile)
+    constrained = _apply_profile_constraints(
         email=email,
         cleaned_body=cleaned_body,
         metadata=base,
         profile=profile,
+    )
+    return _apply_response_intent_signals(
+        email=email,
+        cleaned_body=cleaned_body,
+        metadata=constrained,
     )

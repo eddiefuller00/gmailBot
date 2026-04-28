@@ -18,6 +18,7 @@ describe("OnboardingPage", () => {
     const saveProfile = vi.fn().mockImplementation(async (profile) => profile);
 
     const api = {
+      getCapabilities: vi.fn(),
       getProfile,
       saveProfile,
       getDashboard: vi.fn(),

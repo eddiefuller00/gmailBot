@@ -41,6 +41,7 @@ Service starts on `http://127.0.0.1:8000`.
 - `OPENAI_CHAT_STOP_SEQUENCES` (optional; `|`- or comma-delimited stop strings)
 - `OPENAI_EMBEDDING_MODEL` (default: `text-embedding-3-small`)
 - `DATABASE_PATH` (default: `data/inbox_intelligence.db`)
+- `VITE_GMAIL_AUTO_SYNC_INTERVAL_MS` (frontend process env, milliseconds; min `60000`, default `300000`)
 
 ## API Quickstart
 

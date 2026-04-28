@@ -5,6 +5,46 @@ import { vi } from "vitest";
 import { GmailPage } from "../pages/GmailPage";
 
 describe("GmailPage", () => {
+  it("allows Gmail connect when OAuth and encryption are ready even if inbox sync is unavailable", async () => {
+    const api = {
+      getCapabilities: vi.fn().mockResolvedValue({
+        openai: { configured: false, available: false, message: "Set OPENAI_API_KEY" },
+        gmail_oauth: { configured: true, available: true, message: "OAuth ready" },
+        token_encryption: { configured: true, available: true, message: "Encryption ready" },
+        can_rank_inbox: false,
+        can_sync_gmail: false,
+        last_successful_sync_at: null,
+        last_ai_error: null,
+        last_ai_error_at: null
+      }),
+      getProfile: vi.fn(),
+      saveProfile: vi.fn(),
+      getDashboard: vi.fn(),
+      getAlerts: vi.fn(),
+      askInbox: vi.fn(),
+      ingestEmails: vi.fn(),
+      getGoogleConnection: vi.fn().mockResolvedValue({
+        configured: true,
+        connected: false,
+        email: null,
+        scopes: [],
+        connected_at: null,
+        token_encrypted: false,
+        insecure_storage: false
+      }),
+      getGoogleAuthUrl: vi.fn(),
+      disconnectGoogle: vi.fn(),
+      syncGmailInbox: vi.fn(),
+      listGmailMessages: vi.fn(),
+      getGmailMessageDetail: vi.fn()
+    };
+
+    render(<GmailPage api={api} />);
+
+    const connectButton = await screen.findByRole("button", { name: "Connect Gmail" });
+    expect(connectButton).toBeEnabled();
+  });
+
   it("loads paginated inbox messages and message detail when connected", async () => {
     const listGmailMessages = vi
       .fn()
@@ -44,6 +84,16 @@ describe("GmailPage", () => {
       });
 
     const api = {
+      getCapabilities: vi.fn().mockResolvedValue({
+        openai: { configured: true, available: true, message: "OpenAI ready" },
+        gmail_oauth: { configured: true, available: true, message: "OAuth ready" },
+        token_encryption: { configured: true, available: true, message: "Encryption ready" },
+        can_rank_inbox: true,
+        can_sync_gmail: true,
+        last_successful_sync_at: "2026-04-13T12:00:00Z",
+        last_ai_error: null,
+        last_ai_error_at: null
+      }),
       getProfile: vi.fn(),
       saveProfile: vi.fn(),
       getDashboard: vi.fn(),

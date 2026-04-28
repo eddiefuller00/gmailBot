@@ -7,6 +7,7 @@ export type Category =
   | "newsletter"
   | "personal"
   | "other";
+export type ActionChannel = "reply" | "portal" | "read" | "none";
 
 export interface UserProfile {
   role: string[];
@@ -40,6 +41,12 @@ export interface ExtractedMetadata {
   event_date: string | null;
   company: string | null;
   summary: string;
+  confidence: number;
+  is_bulk: boolean;
+  action_channel: ActionChannel;
+  ai_source: "openai" | "heuristic";
+  prompt_version: string;
+  processing_version: string;
   scoring_breakdown: Record<string, number>;
 }
 
@@ -53,6 +60,11 @@ export interface ProcessedEmail {
   cleaned_body: string;
   received_at: string;
   unread: boolean;
+  gmail_message_id?: string | null;
+  gmail_thread_id?: string | null;
+  content_fingerprint?: string | null;
+  last_processed_at?: string | null;
+  last_synced_at?: string | null;
   metadata: ExtractedMetadata;
 }
 
@@ -66,6 +78,8 @@ export interface DashboardResponse {
 
 export interface QAResponse {
   answer: string;
+  answer_mode: "openai_rag";
+  citations: string[];
   supporting_emails: ProcessedEmail[];
 }
 
@@ -76,6 +90,23 @@ export interface AlertItem {
 
 export interface AlertsResponse {
   alerts: AlertItem[];
+}
+
+export interface CapabilityStatus {
+  configured: boolean;
+  available: boolean;
+  message: string;
+}
+
+export interface CapabilitiesResponse {
+  openai: CapabilityStatus;
+  gmail_oauth: CapabilityStatus;
+  token_encryption: CapabilityStatus;
+  can_rank_inbox: boolean;
+  can_sync_gmail: boolean;
+  last_successful_sync_at: string | null;
+  last_ai_error: string | null;
+  last_ai_error_at: string | null;
 }
 
 export interface GoogleConnectResponse {

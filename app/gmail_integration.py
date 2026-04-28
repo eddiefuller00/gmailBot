@@ -57,6 +57,14 @@ def _require_google_oauth_config() -> None:
         )
 
 
+def _require_encrypted_token_storage() -> None:
+    if token_encryption_enabled():
+        return
+    raise GoogleOAuthConfigError(
+        "Encrypted Gmail token storage is required. Set `TOKEN_ENCRYPTION_KEY`."
+    )
+
+
 def _token_response_to_payload(data: dict[str, Any]) -> dict[str, Any]:
     expires_in = int(data.get("expires_in", 3600))
     return {
@@ -175,6 +183,7 @@ def get_google_connection_status() -> GoogleConnectionStatus:
 
 def build_google_auth_url() -> str:
     _require_google_oauth_config()
+    _require_encrypted_token_storage()
     state = secrets.token_urlsafe(32)
     expires_at = _utc_now() + timedelta(seconds=settings.oauth_state_ttl_seconds)
     db.create_google_oauth_state(state=state, expires_at=expires_at)
@@ -194,6 +203,7 @@ def build_google_auth_url() -> str:
 
 def _exchange_code_for_tokens(code: str) -> dict[str, Any]:
     _require_google_oauth_config()
+    _require_encrypted_token_storage()
     form_data = {
         "grant_type": "authorization_code",
         "code": code,
@@ -206,6 +216,7 @@ def _exchange_code_for_tokens(code: str) -> dict[str, Any]:
 
 def _refresh_access_token(refresh_token: str) -> dict[str, Any]:
     _require_google_oauth_config()
+    _require_encrypted_token_storage()
     form_data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -241,6 +252,7 @@ def handle_google_callback(*, code: str, state: str) -> str | None:
 
 
 def disconnect_google_account() -> None:
+    db.delete_gmail_sync_cursor()
     db.clear_google_oauth_token()
 
 
