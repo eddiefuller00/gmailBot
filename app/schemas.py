@@ -47,6 +47,7 @@ class ExtractedMetadata(BaseModel):
     ai_source: AISource = "openai"
     prompt_version: str = ""
     processing_version: str = ""
+    profile_fingerprint: str = ""
     scoring_breakdown: dict[str, float] = Field(default_factory=dict)
 
 
@@ -74,6 +75,8 @@ class IngestRequest(BaseModel):
 
 class IngestResponse(BaseModel):
     ingested: int
+    has_more: bool | None = None
+    backfill_complete: bool | None = None
 
 
 class DashboardResponse(BaseModel):

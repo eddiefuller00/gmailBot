@@ -11,8 +11,13 @@ interface DashboardPageProps {
 
 const DEFAULT_AUTO_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_AUTO_SYNC_INTERVAL_MS = 60 * 1000;
-const INITIAL_SYNC_MAX_MESSAGES = 200;
-const INTERVAL_SYNC_MAX_MESSAGES = 50;
+const FULL_BACKFILL_SYNC_MAX_MESSAGES = 500;
+const RECENT_SYNC_MAX_MESSAGES = 50;
+const UNREAD_INBOX_QUERY = "is:unread";
+const ALERT_PREVIEW_COUNT = 3;
+const PRIORITY_PREVIEW_COUNT = 3;
+const DEADLINE_PREVIEW_COUNT = 3;
+const RECENT_IMPORTANT_PREVIEW_COUNT = 4;
 
 const parsedAutoSyncInterval = Number(
   import.meta.env.VITE_GMAIL_AUTO_SYNC_INTERVAL_MS ?? DEFAULT_AUTO_SYNC_INTERVAL_MS
@@ -81,24 +86,64 @@ function senderName(value: string | null | undefined, fallback: string): string 
   return value?.trim() || fallback;
 }
 
+function buildGmailThreadUrl(email: DashboardEmail): string | null {
+  if (email.gmail_thread_id) {
+    return `https://mail.google.com/mail/u/0/#all/${email.gmail_thread_id}`;
+  }
+  if (email.gmail_message_id) {
+    return `https://mail.google.com/mail/u/0/#search/rfc822msgid:${encodeURIComponent(email.gmail_message_id)}`;
+  }
+  return null;
+}
+
+function buildSyncStatus(
+  response: { ingested: number; has_more: boolean | null; backfill_complete: boolean | null },
+  syncUntilComplete: boolean
+): string {
+  if (syncUntilComplete) {
+    if (response.backfill_complete) {
+      return response.ingested > 0
+        ? `Unread backfill complete. Processed ${response.ingested} emails.`
+        : "Unread backfill is already complete.";
+    }
+    if (response.has_more) {
+      return `Processed ${response.ingested} unread emails. More unread mail remains in the backlog.`;
+    }
+  }
+
+  if (response.ingested === 0) {
+    return "No unread inbox emails needed syncing.";
+  }
+  if (response.has_more) {
+    return `Synced ${response.ingested} unread emails. More unread mail is queued for backfill.`;
+  }
+  return `Synced ${response.ingested} unread email${response.ingested === 1 ? "" : "s"}.`;
+}
+
 type DashboardEmail = DashboardResponse["top_important_emails"][number];
 
 function EmailRows({
   title,
   emails,
   emptyMessage,
-  actionLabel
+  actionLabel,
+  onAction
 }: {
   title: string;
   emails: DashboardEmail[];
   emptyMessage: string;
   actionLabel?: string;
+  onAction?: () => void;
 }) {
   return (
     <section className="dashboard-card">
       <header className="dashboard-card-header">
         <h3>{title}</h3>
-        {actionLabel ? <span className="dashboard-card-action">{actionLabel}</span> : null}
+        {actionLabel ? (
+          <button type="button" className="dashboard-card-action" onClick={onAction}>
+            {actionLabel}
+          </button>
+        ) : null}
       </header>
 
       {emails.length === 0 ? (
@@ -119,6 +164,7 @@ function EmailRows({
               : email.metadata.event_date
                 ? `Event ${formatDate(email.metadata.event_date)}`
                 : formatTime(email.received_at);
+            const gmailUrl = buildGmailThreadUrl(email);
 
             return (
               <article key={email.id} className="row-item">
@@ -129,7 +175,19 @@ function EmailRows({
                     {senderName(email.from_name, email.from_email)} • {meta}
                   </span>
                 </div>
-                <span className={`row-badge ${badge.toLowerCase().replace(/\s+/g, "-")}`}>{badge}</span>
+                <div className="row-side">
+                  <span className={`row-badge ${badge.toLowerCase().replace(/\s+/g, "-")}`}>{badge}</span>
+                  {gmailUrl ? (
+                    <a
+                      className="row-link"
+                      href={gmailUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open in Gmail
+                    </a>
+                  ) : null}
+                </div>
               </article>
             );
           })}
@@ -139,12 +197,24 @@ function EmailRows({
   );
 }
 
-function SmartAlertsCard({ alerts }: { alerts: AlertsResponse["alerts"] }) {
+function SmartAlertsCard({
+  alerts,
+  actionLabel,
+  onAction
+}: {
+  alerts: AlertsResponse["alerts"];
+  actionLabel?: string;
+  onAction?: () => void;
+}) {
   return (
     <section className="dashboard-card">
       <header className="dashboard-card-header">
         <h3>Smart Alerts</h3>
-        <span className="dashboard-card-action">View all</span>
+        {actionLabel ? (
+          <button type="button" className="dashboard-card-action" onClick={onAction}>
+            {actionLabel}
+          </button>
+        ) : null}
       </header>
       {alerts.length === 0 ? (
         <p className="empty">No active alerts right now.</p>
@@ -179,9 +249,26 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [syncWarning, setSyncWarning] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const syncInFlightRef = useRef(false);
   const [autoSyncEnabled, setAutoSyncEnabled] = useState(false);
+  const [expandedSections, setExpandedSections] = useState({
+    alerts: false,
+    priorities: false,
+    deadlines: false,
+    recent: false
+  });
+
+  const toggleSection = useCallback(
+    (section: keyof typeof expandedSections) => {
+      setExpandedSections((current) => ({
+        ...current,
+        [section]: !current[section]
+      }));
+    },
+    []
+  );
 
   const refreshRankedData = useCallback(async () => {
     const [dashboardData, alertsData, capabilitiesData] = await Promise.all([
@@ -196,21 +283,30 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
   }, [api]);
 
   const syncConnectedGmail = useCallback(
-    async (maxMessages: number) => {
+    async ({
+      maxMessages,
+      syncUntilComplete = false
+    }: {
+      maxMessages: number;
+      syncUntilComplete?: boolean;
+    }) => {
       if (syncInFlightRef.current) {
         return;
       }
       syncInFlightRef.current = true;
       setSyncing(true);
       setSyncWarning(null);
+      setSyncStatus(null);
       try {
-        await api.syncGmailInbox({
+        const response = await api.syncGmailInbox({
           maxMessages,
-          labelIds: ["INBOX"],
-          backfill: true
+          q: UNREAD_INBOX_QUERY,
+          backfill: true,
+          syncUntilComplete
         });
         await refreshRankedData();
         setAutoSyncEnabled(true);
+        setSyncStatus(buildSyncStatus(response, syncUntilComplete));
       } catch (err) {
         setSyncWarning(
           err instanceof Error ? err.message : "Gmail sync failed while refreshing the dashboard."
@@ -270,7 +366,7 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
       if (!connection?.connected || !capabilities?.can_sync_gmail) {
         return;
       }
-      void syncConnectedGmail(INTERVAL_SYNC_MAX_MESSAGES);
+      void syncConnectedGmail({ maxMessages: RECENT_SYNC_MAX_MESSAGES });
     }, AUTO_SYNC_INTERVAL_MS);
 
     return () => {
@@ -314,14 +410,37 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
   const canSyncNow = Boolean(connection?.connected && capabilities.can_sync_gmail);
   const showCapabilityBanner =
     !capabilities.can_sync_gmail || !capabilities.can_rank_inbox || Boolean(capabilities.last_ai_error);
-  const topPriorities = dashboard.action_required.length > 0
-    ? dashboard.action_required.slice(0, 3)
-    : dashboard.top_important_emails.slice(0, 3);
+  const topPriorityPool = (() => {
+    const actionFirst = [...dashboard.action_required];
+    if (actionFirst.length >= PRIORITY_PREVIEW_COUNT) {
+      return actionFirst;
+    }
+    const seen = new Set(actionFirst.map((email) => email.external_id));
+    const filled = [...actionFirst];
+    for (const email of dashboard.top_important_emails) {
+      if (seen.has(email.external_id)) {
+        continue;
+      }
+      seen.add(email.external_id);
+      filled.push(email);
+    }
+    return filled;
+  })();
+  const topPriorities = expandedSections.priorities
+    ? topPriorityPool
+    : topPriorityPool.slice(0, PRIORITY_PREVIEW_COUNT);
   const priorityIds = new Set(topPriorities.map((email) => email.external_id));
-  const recentImportant = dashboard.top_important_emails
+  const recentImportantPool = dashboard.top_important_emails
     .filter((email) => !priorityIds.has(email.external_id))
-    .slice(0, 4);
-  const deadlineItems = dashboard.upcoming_deadlines.slice(0, 3);
+  const recentImportant = expandedSections.recent
+    ? recentImportantPool
+    : recentImportantPool.slice(0, RECENT_IMPORTANT_PREVIEW_COUNT);
+  const deadlineItems = expandedSections.deadlines
+    ? dashboard.upcoming_deadlines
+    : dashboard.upcoming_deadlines.slice(0, DEADLINE_PREVIEW_COUNT);
+  const alertsPreview = expandedSections.alerts
+    ? alerts.alerts
+    : alerts.alerts.slice(0, ALERT_PREVIEW_COUNT);
 
   return (
     <section className="page">
@@ -339,10 +458,22 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
           </div>
           <div className="connection-actions">
             <button
-              onClick={() => void syncConnectedGmail(INITIAL_SYNC_MAX_MESSAGES)}
+              onClick={() =>
+                void syncConnectedGmail({
+                  maxMessages: FULL_BACKFILL_SYNC_MAX_MESSAGES,
+                  syncUntilComplete: true
+                })
+              }
               disabled={!canSyncNow || syncing}
             >
-              {syncing ? "Syncing..." : "Sync Now"}
+              {syncing ? "Syncing..." : "Backfill Unread"}
+            </button>
+            <button
+              className="secondary"
+              onClick={() => void syncConnectedGmail({ maxMessages: RECENT_SYNC_MAX_MESSAGES })}
+              disabled={!canSyncNow || syncing}
+            >
+              Sync Recent
             </button>
             <button className="secondary" onClick={() => void load()}>
               Refresh
@@ -355,30 +486,38 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
       {!connection?.connected ? (
         <p className="warning">Connect Gmail before running inbox syncs.</p>
       ) : null}
+      {syncStatus ? <p className="status">{syncStatus}</p> : null}
       {syncWarning ? <p className="warning">{syncWarning}</p> : null}
 
       <div className="dashboard-layout">
-        <SmartAlertsCard alerts={alerts.alerts} />
+        <SmartAlertsCard
+          alerts={alertsPreview}
+          actionLabel={alerts.alerts.length > ALERT_PREVIEW_COUNT ? (expandedSections.alerts ? "Show less" : "View all") : undefined}
+          onAction={() => toggleSection("alerts")}
+        />
 
         <EmailRows
           title="Top Priorities"
           emails={topPriorities}
           emptyMessage="No priority items yet."
-          actionLabel="View all"
+          actionLabel={topPriorityPool.length > PRIORITY_PREVIEW_COUNT ? (expandedSections.priorities ? "Show less" : "View all") : undefined}
+          onAction={() => toggleSection("priorities")}
         />
 
         <EmailRows
           title="Upcoming Deadlines"
           emails={deadlineItems}
           emptyMessage="No upcoming deadlines."
-          actionLabel="View all"
+          actionLabel={dashboard.upcoming_deadlines.length > DEADLINE_PREVIEW_COUNT ? (expandedSections.deadlines ? "Show less" : "View all") : undefined}
+          onAction={() => toggleSection("deadlines")}
         />
 
         <EmailRows
           title="Recent Important Emails"
           emails={recentImportant}
           emptyMessage="No important emails ranked yet."
-          actionLabel="View all"
+          actionLabel={recentImportantPool.length > RECENT_IMPORTANT_PREVIEW_COUNT ? (expandedSections.recent ? "Show less" : "View all") : undefined}
+          onAction={() => toggleSection("recent")}
         />
 
         <section className="dashboard-card quick-ask-card">

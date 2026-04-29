@@ -69,11 +69,13 @@ def _is_priority_email(
         return False
     if category in NOISY_ALERT_CATEGORIES and category not in priority_categories:
         return False
+    if category == "job" and email.metadata.is_bulk and not _matches_important_sender(email, profile):
+        return False
     if _looks_noisy_marketing(email) and category not in priority_categories and category != "job":
         return False
 
     if category in priority_categories:
-        return True
+        return not email.metadata.is_bulk or _matches_important_sender(email, profile)
     if _matches_important_sender(email, profile):
         return True
     if email.metadata.importance >= 8.8 and email.metadata.action_required:

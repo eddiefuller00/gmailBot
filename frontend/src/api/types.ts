@@ -30,6 +30,8 @@ export interface EmailIngestItem {
 
 export interface IngestResponse {
   ingested: number;
+  has_more: boolean | null;
+  backfill_complete: boolean | null;
 }
 
 export interface ExtractedMetadata {

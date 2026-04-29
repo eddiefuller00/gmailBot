@@ -49,6 +49,7 @@ export interface ApiClient {
     clearNonGmail?: boolean;
     backfill?: boolean;
     resetBackfill?: boolean;
+    syncUntilComplete?: boolean;
   }) => Promise<IngestResponse>;
   listGmailMessages: (options?: {
     maxResults?: number;
@@ -100,8 +101,13 @@ export const apiClient: ApiClient = {
     if (options.resetBackfill) {
       params.set("reset_backfill", "true");
     }
-    for (const labelId of options.labelIds ?? ["INBOX"]) {
-      params.append("label_ids", labelId);
+    if (options.syncUntilComplete) {
+      params.set("sync_until_complete", "true");
+    }
+    if (options.labelIds) {
+      for (const labelId of options.labelIds) {
+        params.append("label_ids", labelId);
+      }
     }
     const suffix = params.toString();
     return request<IngestResponse>(`/gmail/sync?${suffix}`, { method: "POST" });
@@ -117,8 +123,10 @@ export const apiClient: ApiClient = {
     if (options.pageToken) {
       params.set("page_token", options.pageToken);
     }
-    for (const labelId of options.labelIds ?? ["INBOX"]) {
-      params.append("label_ids", labelId);
+    if (options.labelIds) {
+      for (const labelId of options.labelIds) {
+        params.append("label_ids", labelId);
+      }
     }
     const suffix = params.toString();
     return request<GmailMessageListResponse>(`/gmail/messages?${suffix}`);

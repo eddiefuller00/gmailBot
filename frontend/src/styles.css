@@ -326,9 +326,23 @@ textarea {
 }
 
 .dashboard-card-action {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
   color: var(--primary-strong);
   font-size: 0.82rem;
   font-weight: 600;
+  cursor: pointer;
+}
+
+.dashboard-card-action:hover {
+  text-decoration: underline;
+}
+
+.dashboard-card-action:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary-strong) 38%, white);
+  outline-offset: 3px;
 }
 
 .stack-list {
@@ -351,6 +365,13 @@ textarea {
   display: grid;
   gap: 0.18rem;
   min-width: 0;
+}
+
+.row-side {
+  display: grid;
+  justify-items: end;
+  gap: 0.45rem;
+  flex-shrink: 0;
 }
 
 .row-title {
@@ -400,6 +421,22 @@ textarea {
 .row-badge.fyi {
   background: #f3efff;
   color: #6c5ac8;
+}
+
+.row-link {
+  color: var(--primary-strong);
+  font-size: 0.76rem;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.row-link:hover {
+  text-decoration: underline;
+}
+
+.row-link:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary-strong) 38%, white);
+  outline-offset: 3px;
 }
 
 .alert-row {

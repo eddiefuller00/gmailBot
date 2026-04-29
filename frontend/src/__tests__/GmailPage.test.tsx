@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 
@@ -45,7 +45,7 @@ describe("GmailPage", () => {
     expect(connectButton).toBeEnabled();
   });
 
-  it("loads paginated inbox messages and message detail when connected", async () => {
+  it("loads all unread messages and message detail when connected", async () => {
     const listGmailMessages = vi
       .fn()
       .mockResolvedValueOnce({
@@ -75,12 +75,19 @@ describe("GmailPage", () => {
             from_name: "Career Center",
             received_at: "2026-04-13T13:00:00Z",
             snippet: "Meet recruiters this Friday",
-            label_ids: ["INBOX"],
-            is_unread: false
+            label_ids: ["UNREAD"],
+            is_unread: true
           }
         ],
         next_page_token: null,
         result_size_estimate: 2
+      });
+    const syncGmailInbox = vi
+      .fn()
+      .mockResolvedValue({
+        ingested: 1,
+        has_more: false,
+        backfill_complete: false
       });
 
     const api = {
@@ -111,7 +118,7 @@ describe("GmailPage", () => {
       }),
       getGoogleAuthUrl: vi.fn(),
       disconnectGoogle: vi.fn(),
-      syncGmailInbox: vi.fn(),
+      syncGmailInbox,
       listGmailMessages,
       getGmailMessageDetail: vi.fn().mockResolvedValue({
         id: "msg-1",
@@ -131,21 +138,96 @@ describe("GmailPage", () => {
     render(<GmailPage api={api} />);
 
     expect(await screen.findByText("Interview scheduling")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Load more" }));
     expect(await screen.findByText("Campus career fair")).toBeInTheDocument();
+    expect(screen.getByText("2 loaded")).toBeInTheDocument();
     expect(listGmailMessages).toHaveBeenNthCalledWith(1, {
       maxResults: 50,
-      q: undefined,
-      labelIds: ["INBOX"]
+      q: "is:unread",
+      pageToken: undefined
     });
     expect(listGmailMessages).toHaveBeenNthCalledWith(2, {
       maxResults: 50,
-      q: undefined,
-      pageToken: "token-2",
-      labelIds: ["INBOX"]
+      q: "is:unread",
+      pageToken: "token-2"
+    });
+    await waitFor(() => expect(syncGmailInbox).toHaveBeenCalledTimes(2));
+    expect(syncGmailInbox).toHaveBeenNthCalledWith(1, {
+      maxMessages: 1,
+      q: "is:unread",
+      backfill: true
     });
     const openButtons = screen.getAllByRole("button", { name: "Open" });
     await userEvent.click(openButtons[0]);
     expect(await screen.findByText("Please choose a time slot tomorrow.")).toBeInTheDocument();
+  });
+
+  it("preserves already loaded messages when a later unread page fails", async () => {
+    const listGmailMessages = vi
+      .fn()
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: "msg-1",
+            thread_id: "thread-1",
+            subject: "Interview scheduling",
+            from_email: "talent@company.com",
+            from_name: "Talent Team",
+            received_at: "2026-04-13T14:00:00Z",
+            snippet: "Please choose a time slot",
+            label_ids: ["UNREAD"],
+            is_unread: true
+          }
+        ],
+        next_page_token: "token-2",
+        result_size_estimate: 2
+      })
+      .mockRejectedValueOnce(new Error("Gmail API network error"));
+    const syncGmailInbox = vi
+      .fn()
+      .mockResolvedValue({
+        ingested: 1,
+        has_more: false,
+        backfill_complete: false
+      });
+
+    const api = {
+      getCapabilities: vi.fn().mockResolvedValue({
+        openai: { configured: true, available: true, message: "OpenAI ready" },
+        gmail_oauth: { configured: true, available: true, message: "OAuth ready" },
+        token_encryption: { configured: true, available: true, message: "Encryption ready" },
+        can_rank_inbox: true,
+        can_sync_gmail: true,
+        last_successful_sync_at: "2026-04-13T12:00:00Z",
+        last_ai_error: null,
+        last_ai_error_at: null
+      }),
+      getProfile: vi.fn(),
+      saveProfile: vi.fn(),
+      getDashboard: vi.fn(),
+      getAlerts: vi.fn(),
+      askInbox: vi.fn(),
+      ingestEmails: vi.fn(),
+      getGoogleConnection: vi.fn().mockResolvedValue({
+        configured: true,
+        connected: true,
+        email: "me@example.com",
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+        connected_at: "2026-04-13T12:00:00Z",
+        token_encrypted: true,
+        insecure_storage: false
+      }),
+      getGoogleAuthUrl: vi.fn(),
+      disconnectGoogle: vi.fn(),
+      syncGmailInbox,
+      listGmailMessages,
+      getGmailMessageDetail: vi.fn()
+    };
+
+    render(<GmailPage api={api} />);
+
+    expect(await screen.findByText("Interview scheduling")).toBeInTheDocument();
+    expect(await screen.findByText("Gmail API network error")).toBeInTheDocument();
+    expect(screen.getByText("1 loaded")).toBeInTheDocument();
+    await waitFor(() => expect(syncGmailInbox).toHaveBeenCalledTimes(1));
   });
 });

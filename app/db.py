@@ -96,6 +96,7 @@ def init_db() -> None:
             "ai_source TEXT NOT NULL DEFAULT 'openai'",
             "prompt_version TEXT NOT NULL DEFAULT ''",
             "processing_version TEXT NOT NULL DEFAULT ''",
+            "profile_fingerprint TEXT NOT NULL DEFAULT ''",
             "gmail_message_id TEXT",
             "gmail_thread_id TEXT",
             "content_fingerprint TEXT",
@@ -208,10 +209,11 @@ def upsert_processed_email(
                 external_id, from_email, from_name, subject, body, cleaned_body, received_at, unread,
                 category, importance, reason, action_required, deadline, event_date, company, summary,
                 confidence, is_bulk, action_channel, ai_source, prompt_version, processing_version,
+                profile_fingerprint,
                 scoring_breakdown, embedding, gmail_message_id, gmail_thread_id, content_fingerprint,
                 last_processed_at, last_synced_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(external_id) DO UPDATE SET
                 from_email=excluded.from_email,
                 from_name=excluded.from_name,
@@ -234,6 +236,7 @@ def upsert_processed_email(
                 ai_source=excluded.ai_source,
                 prompt_version=excluded.prompt_version,
                 processing_version=excluded.processing_version,
+                profile_fingerprint=excluded.profile_fingerprint,
                 scoring_breakdown=excluded.scoring_breakdown,
                 embedding=excluded.embedding,
                 gmail_message_id=excluded.gmail_message_id,
@@ -265,6 +268,7 @@ def upsert_processed_email(
                 metadata.ai_source,
                 metadata.prompt_version,
                 metadata.processing_version,
+                metadata.profile_fingerprint,
                 json.dumps(metadata.scoring_breakdown),
                 json.dumps(embedding),
                 gmail_message_id,
@@ -293,6 +297,7 @@ def _row_to_processed_email(row: sqlite3.Row) -> ProcessedEmail:
         ai_source=row["ai_source"],
         prompt_version=row["prompt_version"],
         processing_version=row["processing_version"],
+        profile_fingerprint=row["profile_fingerprint"],
         scoring_breakdown=json.loads(row["scoring_breakdown"]),
     )
     return ProcessedEmail(
@@ -428,12 +433,60 @@ def list_outdated_processed_emails(
                OR processing_version != ?
                OR ai_source != 'openai'
                OR content_fingerprint IS NULL
-            ORDER BY last_processed_at ASC, received_at DESC
+            ORDER BY received_at DESC, last_processed_at ASC
             LIMIT ?
             """,
             (prompt_version, processing_version, limit),
         ).fetchall()
     return [_row_to_processed_email(row) for row in rows]
+
+
+def list_profile_stale_processed_emails(
+    *,
+    profile_fingerprint: str,
+    limit: int = 200,
+) -> list[ProcessedEmail]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM emails
+            WHERE profile_fingerprint != ?
+            ORDER BY received_at DESC, last_processed_at ASC
+            LIMIT ?
+            """,
+            (profile_fingerprint, limit),
+        ).fetchall()
+    return [_row_to_processed_email(row) for row in rows]
+
+
+def update_processed_email_scoring(
+    *,
+    external_id: str,
+    importance: float,
+    scoring_breakdown: dict[str, float],
+    profile_fingerprint: str,
+    last_processed_at: datetime | None = None,
+) -> None:
+    processed_at = last_processed_at or _utc_now()
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE emails
+            SET importance=?,
+                scoring_breakdown=?,
+                profile_fingerprint=?,
+                last_processed_at=?
+            WHERE external_id=?
+            """,
+            (
+                float(importance),
+                json.dumps(scoring_breakdown),
+                profile_fingerprint,
+                _to_iso(processed_at),
+                external_id,
+            ),
+        )
+        conn.commit()
 
 
 def count_unread_important(min_importance: float = 7.0) -> int:
@@ -455,6 +508,15 @@ def delete_non_gmail_emails() -> int:
     with _connect() as conn:
         cursor = conn.execute(
             "DELETE FROM emails WHERE external_id NOT LIKE 'gmail:%'"
+        )
+        conn.commit()
+    return int(cursor.rowcount or 0)
+
+
+def delete_sample_emails() -> int:
+    with _connect() as conn:
+        cursor = conn.execute(
+            "DELETE FROM emails WHERE external_id LIKE 'smoke-%'"
         )
         conn.commit()
     return int(cursor.rowcount or 0)
