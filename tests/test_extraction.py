@@ -11,8 +11,8 @@ from app.extraction import (
 from app.prompting import (
     EMAIL_EXTRACTION_PROMPT_VERSION,
     PROCESSING_VERSION,
-    MAX_EXTRACTION_BODY_CHARS,
     build_extraction_user_payload,
+    MAX_EXTRACTION_BODY_CHARS,
 )
 from app.schemas import EmailIngestItem, UserProfile
 
@@ -193,6 +193,34 @@ def test_extract_metadata_reclassifies_job_digest_as_newsletter() -> None:
             "View all jobs. You received this email because you have an account. "
             "Unsubscribe and manage your preferences."
         ),
+        received_at=datetime(2026, 4, 14, 12, 0, tzinfo=timezone.utc),
+        unread=True,
+    )
+    profile = UserProfile(priorities=["jobs"], deprioritize=["newsletters"])
+
+    metadata = extract_metadata(email, email.body, profile, allow_fallback=True)
+
+    assert metadata.category == "newsletter"
+    assert metadata.action_required is False
+    assert metadata.is_bulk is True
+
+
+def test_build_extraction_user_payload_includes_profile_first_rules() -> None:
+    email = _sample_email()
+    payload = build_extraction_user_payload(email, email.body, UserProfile(priorities=["jobs"]))
+
+    rules = payload["rules"]
+    assert any("onboarding priorities" in rule for rule in rules)
+    assert any("sender, subject, and body evidence" in rule for rule in rules)
+
+
+def test_extract_metadata_reclassifies_content_digest_as_newsletter() -> None:
+    email = EmailIngestItem(
+        external_id="e-5",
+        from_email="news@email.microsoftstart.com",
+        from_name="Best of MSN",
+        subject="Every TV show getting cancelled in 2026 (full list)",
+        body="Read online. Best of MSN roundup. Manage your preferences.",
         received_at=datetime(2026, 4, 14, 12, 0, tzinfo=timezone.utc),
         unread=True,
     )

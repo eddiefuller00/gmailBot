@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import html
 import re
 import secrets
@@ -116,24 +117,37 @@ def _http_post_form(url: str, form_data: dict[str, Any]) -> dict[str, Any]:
     return response.json()
 
 
-def _gmail_get_json(path: str, *, params: Any | None = None) -> dict[str, Any]:
-    access_token = get_valid_access_token()
-    with httpx.Client(timeout=30.0) as client:
-        response = client.get(
-            f"https://gmail.googleapis.com{path}",
-            params=params,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-
-    if response.status_code == 401:
-        # Access token may have expired server-side; refresh and retry once.
-        access_token = get_valid_access_token(force_refresh=True)
+def _gmail_get_response(
+    path: str, *, params: Any | None = None, access_token: str
+) -> httpx.Response:
+    try:
         with httpx.Client(timeout=30.0) as client:
-            response = client.get(
+            return client.get(
                 f"https://gmail.googleapis.com{path}",
                 params=params,
                 headers={"Authorization": f"Bearer {access_token}"},
             )
+    except httpx.RequestError as exc:
+        raise RuntimeError(f"Gmail API network error: {exc}") from exc
+
+
+def _gmail_get_json(path: str, *, params: Any | None = None) -> dict[str, Any]:
+    access_token = get_valid_access_token()
+    response: httpx.Response | None = None
+    first_error: RuntimeError | None = None
+
+    try:
+        response = _gmail_get_response(path, params=params, access_token=access_token)
+    except RuntimeError as exc:
+        first_error = exc
+
+    if first_error is not None:
+        response = _gmail_get_response(path, params=params, access_token=access_token)
+
+    if response.status_code == 401:
+        # Access token may have expired server-side; refresh and retry once.
+        access_token = get_valid_access_token(force_refresh=True)
+        response = _gmail_get_response(path, params=params, access_token=access_token)
 
     if response.status_code >= 400:
         raise RuntimeError(
@@ -406,16 +420,16 @@ def list_gmail_messages(
         params.append(("pageToken", page_token))
     if query:
         params.append(("q", query))
-    for label in label_ids or ["INBOX"]:
+    effective_label_ids = label_ids if label_ids is not None else ([] if query else ["INBOX"])
+    for label in effective_label_ids:
         params.append(("labelIds", label))
 
     list_response = _gmail_get_json("/gmail/v1/users/me/messages", params=params)
     messages = list_response.get("messages", [])
-    summaries: list[GmailMessageSummary] = []
-    for message in messages:
-        message_id = message.get("id")
-        if not message_id:
-            continue
+    message_ids = [str(message.get("id", "")).strip() for message in messages]
+    message_ids = [message_id for message_id in message_ids if message_id]
+
+    def fetch_summary(message_id: str) -> GmailMessageSummary:
         detail = _gmail_get_json(
             f"/gmail/v1/users/me/messages/{message_id}",
             params={
@@ -423,7 +437,14 @@ def list_gmail_messages(
                 "metadataHeaders": ["Subject", "From", "Date"],
             },
         )
-        summaries.append(_to_summary(detail))
+        return _to_summary(detail)
+
+    if not message_ids:
+        summaries: list[GmailMessageSummary] = []
+    else:
+        max_workers = min(12, len(message_ids))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            summaries = list(executor.map(fetch_summary, message_ids))
 
     return GmailMessageListResponse(
         messages=summaries,
@@ -444,7 +465,8 @@ def list_gmail_message_ids(
         params.append(("pageToken", page_token))
     if query:
         params.append(("q", query))
-    for label in label_ids or ["INBOX"]:
+    effective_label_ids = label_ids if label_ids is not None else ([] if query else ["INBOX"])
+    for label in effective_label_ids:
         params.append(("labelIds", label))
 
     list_response = _gmail_get_json("/gmail/v1/users/me/messages", params=params)

@@ -10,9 +10,9 @@ from app.profile_preferences import (
 from app.schemas import EmailIngestItem, ProcessedEmail, UserProfile
 
 
-EMAIL_EXTRACTION_PROMPT_VERSION = "email-extraction-v2"
+EMAIL_EXTRACTION_PROMPT_VERSION = "email-extraction-v3"
 ASK_INBOX_PROMPT_VERSION = "ask-inbox-v1"
-PROCESSING_VERSION = "processing-v2"
+PROCESSING_VERSION = "processing-v3"
 MAX_EXTRACTION_BODY_CHARS = 4000
 EXTRACTION_BODY_HEAD_CHARS = 2800
 EXTRACTION_BODY_TAIL_CHARS = 1000
@@ -22,15 +22,20 @@ EMAIL_EXTRACTION_SYSTEM_PROMPT = (
     "You are an inbox ranking analyst for a single user. "
     "Classify each email using the onboarding profile, extract the action channel, "
     "estimate confidence, and separate high-signal personal workflow from bulk automation. "
+    "Base every decision on explicit evidence from the sender, subject, and body. "
     "Output strict JSON only."
 )
 
 EMAIL_EXTRACTION_RULES = [
     "Prioritize what matters to this specific user over generic email taxonomy.",
+    "Use the user's onboarding priorities as the primary ranking lens before generic urgency or recency.",
     "Use the user's priorities and important sender preferences to explain why the email matters.",
+    "Base the category, action_required flag, and reason on concrete sender, subject, and body evidence, not on generic marketing phrasing alone.",
     "Only classify as 'job' when the email is directly about the user's candidacy, application, interview, assessment, offer, recruiter follow-up, or employer workflow.",
     "Only classify as 'school' when there is explicit academic context such as a professor, registrar, class, tuition, assignment, or campus workflow.",
+    "Do not treat article headlines, shopping offers, mass recommendations, or entertainment/news digests as user priorities unless the onboarding profile explicitly prioritizes them.",
     "Classify bulk promotions, newsletters, digests, and content roundups as low-personal-relevance even if they contain urgency language.",
+    "Do not elevate sale end dates, coupon expirations, or promotional deadlines into high-priority workflow items.",
     "Set `is_bulk=true` for automated campaigns, digests, no-reply senders, or broad-audience alerts.",
     "Use `action_channel=reply` only when the sender is asking for a direct response.",
     "Use `action_channel=portal` when the user needs to act through a link, site, or form rather than reply by email.",
@@ -216,6 +221,44 @@ EMAIL_EXTRACTION_FEW_SHOTS: list[dict[str, Any]] = [
             "company": "Efinancialcareers",
             "summary": "Automated jobs digest with broad recommendations and preference links.",
             "confidence": 0.97,
+            "is_bulk": True,
+            "action_channel": "none",
+        },
+    },
+    {
+        "input": {
+            "subject": "Every TV show getting cancelled in 2026 (full list)",
+            "from_email": "news@email.microsoftstart.com",
+            "body": "Best of MSN roundup. Read online and manage your preferences.",
+        },
+        "output": {
+            "category": "newsletter",
+            "reason": "Content digest from a news sender, not a direct workflow item in the user's onboarding priorities.",
+            "action_required": False,
+            "deadline": None,
+            "event_date": None,
+            "company": "Microsoftstart",
+            "summary": "MSN content roundup about canceled TV shows with read-online and preference links.",
+            "confidence": 0.99,
+            "is_bulk": True,
+            "action_channel": "none",
+        },
+    },
+    {
+        "input": {
+            "subject": "Treat yourself with 30% convenience order!",
+            "from_email": "uber@uber.com",
+            "body": "30% off convenience items until tonight. Terms apply. Unsubscribe.",
+        },
+        "output": {
+            "category": "promotion",
+            "reason": "Retail-style discount promotion unrelated to the user's stated workflow priorities.",
+            "action_required": False,
+            "deadline": None,
+            "event_date": None,
+            "company": "Uber",
+            "summary": "Uber promotional discount on convenience orders with same-day expiry language.",
+            "confidence": 0.99,
             "is_bulk": True,
             "action_channel": "none",
         },

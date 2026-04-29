@@ -149,3 +149,30 @@ def test_scoring_downranks_news_digest_with_candidate_language() -> None:
     score, breakdown = compute_importance(email, metadata, profile)
     assert score <= 5.0
     assert breakdown["marketing_noise_penalty"] <= -3.0
+
+
+def test_scoring_penalizes_irrelevant_bulk_action_email_for_job_seeker() -> None:
+    profile = UserProfile(
+        priorities=["jobs", "school"],
+        important_senders=["recruiters"],
+        deprioritize=["promotions", "newsletters"],
+    )
+    email = EmailIngestItem(
+        external_id="e-8",
+        from_email="uber@uber.com",
+        subject="Treat yourself with 30% convenience order!",
+        body="30% off convenience items until tonight. Terms apply. Unsubscribe.",
+        received_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    metadata = ExtractedMetadata(
+        category="promotion",
+        action_required=False,
+        confidence=0.95,
+        is_bulk=True,
+    )
+
+    score, breakdown = compute_importance(email, metadata, profile)
+
+    assert score <= 3.5
+    assert breakdown["profile_alignment_adjustment"] < 0
+    assert breakdown["content_evidence_adjustment"] < 0

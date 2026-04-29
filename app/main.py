@@ -136,9 +136,18 @@ def alerts() -> AlertsResponse:
     _require_ai_capability()
     profile = db.get_profile()
     try:
-        deadline_items = db.list_with_deadlines(limit=40)
-        action_items = db.list_action_required(limit=40)
-        top_important = db.list_top_important(limit=60)
+        if db.get_google_oauth_token() is not None:
+            db.delete_sample_emails()
+        service.refresh_profile_scores(profile, limit=200)
+        deadline_items = [
+            email for email in db.list_with_deadlines(limit=40) if not email.external_id.startswith("smoke-")
+        ]
+        action_items = [
+            email for email in db.list_action_required(limit=40) if not email.external_id.startswith("smoke-")
+        ]
+        top_important = [
+            email for email in db.list_top_important(limit=60) if not email.external_id.startswith("smoke-")
+        ]
         unread_important_count = db.count_unread_important(min_importance=7.0)
         return AlertsResponse(
             alerts=generate_alerts(
@@ -242,18 +251,24 @@ def gmail_sync(
     clear_non_gmail: bool = Query(default=False),
     backfill: bool = Query(default=False),
     reset_backfill: bool = Query(default=False),
+    sync_until_complete: bool = Query(default=False),
 ) -> IngestResponse:
     _require_ai_capability()
     try:
-        ingested = service.sync_connected_gmail(
+        result = service.sync_connected_gmail(
             max_messages=max_messages,
             query=q,
             label_ids=label_ids,
             clear_non_gmail=clear_non_gmail,
             backfill=backfill,
             reset_backfill=reset_backfill,
+            sync_until_complete=sync_until_complete,
         )
-        return IngestResponse(ingested=ingested)
+        return IngestResponse(
+            ingested=result.ingested,
+            has_more=result.has_more,
+            backfill_complete=result.backfill_complete,
+        )
     except GmailNotConnectedError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except (AIRuntimeError, AIProcessingError) as exc:

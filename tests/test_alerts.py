@@ -147,3 +147,33 @@ def test_alerts_skip_recruiter_stale_for_no_reply_link_notifications() -> None:
     messages = [item.message.lower() for item in alerts]
 
     assert all("no response to recruiter email" not in message for message in messages)
+
+
+def test_alerts_skip_bulk_job_digest_even_if_marked_job() -> None:
+    profile = UserProfile(
+        priorities=["jobs"],
+        important_senders=["recruiters"],
+        deprioritize=["newsletters"],
+        highlight_deadlines=True,
+    )
+    digest = _build_email(
+        eid="id-5",
+        subject="Every TV show getting cancelled in 2026 (full list)",
+        from_email="news@email.microsoftstart.com",
+        category="job",
+        importance=8.9,
+        action_required=True,
+    )
+    digest.metadata.is_bulk = True
+    digest.metadata.summary = "Best of MSN roundup. Read online and manage your preferences."
+
+    alerts = generate_alerts(
+        profile=profile,
+        deadlines=[],
+        action_required=[digest],
+        top_important=[digest],
+        unread_important_count=1,
+    )
+    messages = [item.message.lower() for item in alerts]
+
+    assert all("every tv show getting cancelled" not in message for message in messages)

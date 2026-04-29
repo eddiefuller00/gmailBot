@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from app import service
 from app.ai_runtime import AIProcessingError
+from app.profile_preferences import profile_processing_fingerprint
 from app.schemas import ExtractedMetadata, GmailMessageDetail, UserProfile
 
 
@@ -77,9 +78,11 @@ def test_sync_connected_gmail_ingests_messages(monkeypatch) -> None:
 
     monkeypatch.setattr(service, "process_email", fake_process_email)
 
-    ingested = service.sync_connected_gmail(max_messages=2)
+    result = service.sync_connected_gmail(max_messages=2)
 
-    assert ingested == 2
+    assert result.ingested == 2
+    assert result.has_more is True
+    assert result.backfill_complete is None
     assert processed_external_ids == ["gmail:m-1", "gmail:m-2"]
 
 
@@ -145,9 +148,11 @@ def test_sync_connected_gmail_backfill_resumes_from_saved_cursor(monkeypatch) ->
         lambda email, profile, **kwargs: processed_external_ids.append(email.external_id),
     )
 
-    ingested = service.sync_connected_gmail(max_messages=2, backfill=True)
+    result = service.sync_connected_gmail(max_messages=2, backfill=True)
 
-    assert ingested == 2
+    assert result.ingested == 2
+    assert result.has_more is True
+    assert result.backfill_complete is False
     assert processed_external_ids == ["gmail:m-10", "gmail:m-11"]
     assert upserts == [("cursor-3", False)]
 
@@ -208,14 +213,89 @@ def test_sync_connected_gmail_backfill_complete_syncs_latest_window(monkeypatch)
     )
     monkeypatch.setattr(service, "process_email", lambda email, profile, **kwargs: None)
 
-    ingested = service.sync_connected_gmail(max_messages=1, backfill=True)
+    result = service.sync_connected_gmail(max_messages=1, backfill=True)
 
-    assert ingested == 1
+    assert result.ingested == 1
+    assert result.has_more is True
+    assert result.backfill_complete is True
     assert upserts == []
 
 
-def test_sync_connected_gmail_reuses_existing_processing_for_unchanged_message(monkeypatch) -> None:
+def test_sync_connected_gmail_until_complete_exhausts_unread_backfill(monkeypatch) -> None:
     monkeypatch.setattr(service.db, "get_profile", lambda: UserProfile())
+    monkeypatch.setattr(service.db, "get_processed_email_record", lambda external_id: None)
+    monkeypatch.setattr(service.db, "set_runtime_state", lambda key, value: None)
+    monkeypatch.setattr(service.db, "get_gmail_sync_cursor", lambda scope_key: None)
+    upserts: list[tuple[str | None, bool]] = []
+    monkeypatch.setattr(service.db, "delete_gmail_sync_cursor", lambda scope_key=None: None)
+    monkeypatch.setattr(
+        service.db,
+        "upsert_gmail_sync_cursor",
+        lambda *, scope_key, next_page_token, is_complete: upserts.append(
+            (next_page_token, is_complete)
+        ),
+    )
+
+    page_calls: list[str | None] = []
+
+    def fake_list_gmail_message_ids(
+        *,
+        max_results: int,
+        page_token: str | None,
+        query: str | None,
+        label_ids: list[str] | None,
+    ) -> tuple[list[str], str | None]:
+        assert max_results == 50
+        assert query == "is:unread"
+        assert label_ids == []
+        page_calls.append(page_token)
+        if page_token is None:
+            return ["m-1", "m-2"], "cursor-2"
+        return ["m-3"], None
+
+    monkeypatch.setattr(service, "list_gmail_message_ids", fake_list_gmail_message_ids)
+    monkeypatch.setattr(
+        service,
+        "get_gmail_message_detail",
+        lambda message_id: GmailMessageDetail(
+            id=message_id,
+            thread_id=f"t-{message_id}",
+            subject="Unread",
+            from_email="sender@example.com",
+            from_name="Sender",
+            received_at=datetime(2026, 4, 14, 12, 0, tzinfo=timezone.utc),
+            snippet="s",
+            body_text="b",
+            label_ids=["INBOX", "UNREAD"],
+            is_unread=True,
+        ),
+    )
+
+    processed_external_ids: list[str] = []
+    monkeypatch.setattr(
+        service,
+        "process_email",
+        lambda email, profile, **kwargs: processed_external_ids.append(email.external_id),
+    )
+
+    result = service.sync_connected_gmail(
+        max_messages=1,
+        query="is:unread",
+        backfill=True,
+        sync_until_complete=True,
+    )
+
+    assert result.ingested == 3
+    assert result.has_more is False
+    assert result.backfill_complete is True
+    assert processed_external_ids == ["gmail:m-1", "gmail:m-2", "gmail:m-3"]
+    assert page_calls == [None, "cursor-2"]
+    assert upserts == [("cursor-2", False), (None, True)]
+
+
+def test_sync_connected_gmail_reuses_existing_processing_for_unchanged_message(monkeypatch) -> None:
+    profile = UserProfile()
+    monkeypatch.setattr(service.db, "get_profile", lambda: profile)
     monkeypatch.setattr(service.db, "get_gmail_sync_cursor", lambda scope_key: None)
     monkeypatch.setattr(service.db, "set_runtime_state", lambda key, value: None)
     monkeypatch.setattr(
@@ -262,11 +342,12 @@ def test_sync_connected_gmail_reuses_existing_processing_for_unchanged_message(m
             summary="Recruiter asks for an interview slot.",
             confidence=0.95,
             action_channel="reply",
-            ai_source="openai",
-            prompt_version=service.EMAIL_EXTRACTION_PROMPT_VERSION,
-            processing_version=service.PROCESSING_VERSION,
-        ),
-    )
+                ai_source="openai",
+                prompt_version=service.EMAIL_EXTRACTION_PROMPT_VERSION,
+                processing_version=service.PROCESSING_VERSION,
+                profile_fingerprint=profile_processing_fingerprint(profile),
+            ),
+        )
     monkeypatch.setattr(
         service.db,
         "get_processed_email_record",
@@ -287,9 +368,11 @@ def test_sync_connected_gmail_reuses_existing_processing_for_unchanged_message(m
         lambda email, profile, **kwargs: process_calls.append(email.external_id),
     )
 
-    ingested = service.sync_connected_gmail(max_messages=1)
+    result = service.sync_connected_gmail(max_messages=1)
 
-    assert ingested == 1
+    assert result.ingested == 1
+    assert result.has_more is False
+    assert result.backfill_complete is None
     assert not process_calls
     assert upsert_calls
 

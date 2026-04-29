@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.profile_preferences import (
     profile_deprioritize_categories,
+    profile_processing_fingerprint,
     profile_priority_categories,
     normalize_important_sender_preferences,
 )
@@ -130,6 +131,43 @@ CONTENT_DIGEST_SENDER_HINTS = {
     "alerts",
 }
 
+EVENT_CONTEXT_TERMS = [
+    "meeting",
+    "calendar",
+    "invite",
+    "invitation",
+    "webinar",
+    "workshop",
+    "event",
+    "schedule",
+]
+
+BILL_CONTEXT_TERMS = [
+    "invoice",
+    "payment due",
+    "balance due",
+    "amount due",
+    "statement available",
+    "autopay",
+    "past due",
+    "charged",
+    "receipt",
+]
+
+SCHOOL_CONTEXT_TERMS = [
+    "school",
+    "college",
+    "university",
+    "course",
+    "professor",
+    "campus",
+    "syllabus",
+    "homework",
+    "assignment",
+    "registrar",
+    "tuition",
+]
+
 
 def _contains_any(text: str, terms: list[str]) -> int:
     lower = text.lower()
@@ -173,6 +211,23 @@ def _sender_weight(from_email: str, profile: UserProfile) -> float:
     return value
 
 
+def _matches_important_sender(from_email: str, profile: UserProfile) -> bool:
+    preferences = normalize_important_sender_preferences(profile.important_senders)
+    if not preferences:
+        return False
+
+    lower = from_email.lower()
+    bulk_sender = _is_bulk_sender(from_email)
+    if "recruiters" in preferences and any(x in lower for x in ["recruit", "talent", "hiring"]):
+        return not bulk_sender
+    if "professors" in preferences and ".edu" in lower:
+        return True
+    if "companies" in preferences and not bulk_sender:
+        return True
+
+    return any(value and value in lower for value in preferences)
+
+
 def _priority_match(
     category: str,
     *,
@@ -190,7 +245,7 @@ def _priority_match(
 
 
 def _deprioritize_penalty(category: str, *, deprioritize_categories: set[str]) -> float:
-    return -4.0 if category in deprioritize_categories else 0.0
+    return -5.0 if category in deprioritize_categories else 0.0
 
 
 def _urgency_score(text: str, *, category: str) -> float:
@@ -210,13 +265,13 @@ def _deadline_score(
 ) -> float:
     if metadata.deadline:
         if metadata.category in {"promotion", "newsletter"}:
-            return 2.5
+            return 0.5
         if profile.highlight_deadlines and metadata.category in priority_categories:
             return 10.0
         return 7.0 if profile.highlight_deadlines else 5.0
     if metadata.event_date:
         if metadata.category in {"promotion", "newsletter"}:
-            return 2.0
+            return 0.5
         return 8.0 if metadata.category in priority_categories else 5.5
     return 1.5
 
@@ -229,7 +284,7 @@ def _action_required_score(
     if not metadata.action_required:
         return 2.0
     if metadata.category in {"promotion", "newsletter"}:
-        return 1.5
+        return 1.0
     if metadata.category in priority_categories:
         return 10.0
     return 7.0
@@ -374,8 +429,56 @@ def _job_specificity_adjustment(email: EmailIngestItem, metadata: ExtractedMetad
     if _has_strong_job_signal(text, email.from_email):
         return 1.2
     if _contains_any(text, GENERIC_JOB_MARKETING_TERMS) > 0:
-        return -2.0
-    return -0.8
+        return -2.5
+    return -1.2
+
+
+def _content_evidence_adjustment(email: EmailIngestItem, metadata: ExtractedMetadata) -> float:
+    text = f"{email.subject}\n{email.body}".lower()
+    category = metadata.category
+
+    if category == "job":
+        return 0.8 if _has_strong_job_signal(text, email.from_email) else -2.2
+    if category == "school":
+        return 0.7 if _contains_any(text, SCHOOL_CONTEXT_TERMS) > 0 else -1.8
+    if category == "bill":
+        return 0.7 if _contains_any(text, BILL_CONTEXT_TERMS) > 0 else -1.8
+    if category == "event":
+        if metadata.event_date or _contains_any(text, EVENT_CONTEXT_TERMS) > 0:
+            return 0.6
+        return -1.2
+    if category in {"promotion", "newsletter"} and metadata.is_bulk:
+        return -0.8
+    return 0.0
+
+
+def _profile_alignment_adjustment(
+    email: EmailIngestItem,
+    metadata: ExtractedMetadata,
+    *,
+    profile: UserProfile,
+    priority_categories: set[str],
+    deprioritize_categories: set[str],
+) -> float:
+    category = metadata.category
+    has_priorities = bool(priority_categories)
+    important_sender = _matches_important_sender(email.from_email, profile)
+
+    if category in deprioritize_categories:
+        return -2.5
+    if category in priority_categories:
+        if metadata.is_bulk and not important_sender:
+            return -0.4
+        return 1.4
+    if not has_priorities:
+        return 0.0
+    if important_sender and metadata.action_required:
+        return 0.5
+
+    penalty = -1.6
+    if metadata.is_bulk:
+        penalty -= 0.8
+    return penalty
 
 
 def _reply_intent_adjustment(email: EmailIngestItem, metadata: ExtractedMetadata) -> float:
@@ -430,6 +533,14 @@ def compute_importance(
         deprioritize_categories=deprioritize_categories,
     )
     job_specificity = _job_specificity_adjustment(email, metadata)
+    content_evidence = _content_evidence_adjustment(email, metadata)
+    profile_alignment = _profile_alignment_adjustment(
+        email,
+        metadata,
+        profile=profile,
+        priority_categories=priority_categories,
+        deprioritize_categories=deprioritize_categories,
+    )
     reply_intent = _reply_intent_adjustment(email, metadata)
     action_channel = _action_channel_adjustment(metadata)
     response_signals = detect_response_intent(
@@ -439,17 +550,19 @@ def compute_importance(
     )
 
     score = (
-        sender * 0.22
-        + priority * 0.33
-        + urgency * 0.08
-        + deadline * 0.11
-        + action * 0.12
+        sender * 0.18
+        + priority * 0.4
+        + urgency * 0.05
+        + deadline * 0.08
+        + action * 0.1
         + confidence * 0.06
-        + recency * 0.14
+        + recency * 0.08
         + deprioritize_penalty
         + bulk_penalty
         + noise_penalty
         + job_specificity
+        + content_evidence
+        + profile_alignment
         + reply_intent
         + action_channel
     )
@@ -466,6 +579,8 @@ def compute_importance(
         "bulk_penalty": round(bulk_penalty, 2),
         "marketing_noise_penalty": round(noise_penalty, 2),
         "job_specificity_adjustment": round(job_specificity, 2),
+        "content_evidence_adjustment": round(content_evidence, 2),
+        "profile_alignment_adjustment": round(profile_alignment, 2),
         "reply_intent_adjustment": round(reply_intent, 2),
         "action_channel_adjustment": round(action_channel, 2),
         "no_reply_sender_signal": 1.0 if response_signals.no_reply_sender else 0.0,
@@ -473,4 +588,5 @@ def compute_importance(
         "reply_requested_signal": 1.0 if response_signals.likely_needs_reply else 0.0,
         "final_score": score,
     }
+    metadata.profile_fingerprint = profile_processing_fingerprint(profile)
     return score, breakdown

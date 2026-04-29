@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 
 from app.schemas import UserProfile
@@ -226,3 +228,16 @@ def normalize_important_sender_preferences(values: list[str]) -> set[str]:
                 break
         normalized.add(canonical or lowered)
     return normalized
+
+
+def profile_processing_fingerprint(profile: UserProfile) -> str:
+    normalized = {
+        "role": sorted({" ".join(value.lower().split()) for value in profile.role if value.strip()}),
+        "graduating_soon": bool(profile.graduating_soon),
+        "priorities": sorted(expand_priority_categories(profile.priorities)),
+        "important_senders": sorted(normalize_important_sender_preferences(profile.important_senders)),
+        "deprioritize": sorted(expand_deprioritize_categories(profile.deprioritize)),
+        "highlight_deadlines": bool(profile.highlight_deadlines),
+    }
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

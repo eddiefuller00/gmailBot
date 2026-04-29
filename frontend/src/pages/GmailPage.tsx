@@ -13,7 +13,8 @@ interface GmailPageProps {
   api?: ApiClient;
 }
 
-const PAGE_SIZE = 50;
+const FETCH_PAGE_SIZE = 50;
+const UNREAD_QUERY = "is:unread";
 
 function formatDate(value: string | null): string {
   if (!value) {
@@ -51,23 +52,27 @@ function mergeMessagePages(
   return merged;
 }
 
+function buildUnreadSearchQuery(search: string): string {
+  const normalized = search.trim();
+  return normalized ? `${UNREAD_QUERY} ${normalized}` : UNREAD_QUERY;
+}
+
 export function GmailPage({ api = apiClient }: GmailPageProps) {
   const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);
   const [connection, setConnection] = useState<GoogleConnectionStatus | null>(null);
   const [messages, setMessages] = useState<GmailMessageSummary[]>([]);
   const [selectedMessage, setSelectedMessage] = useState<GmailMessageDetail | null>(null);
-  const [nextPageToken, setNextPageToken] = useState<string | null>(null);
-  const [resultSizeEstimate, setResultSizeEstimate] = useState<number | null>(null);
   const [appliedQuery, setAppliedQuery] = useState("");
   const [query, setQuery] = useState("");
   const [loadingConnection, setLoadingConnection] = useState(true);
   const [loadingMessages, setLoadingMessages] = useState(false);
-  const [loadingMore, setLoadingMore] = useState(false);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [loadingProgress, setLoadingProgress] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const messagesScrollRef = useRef<HTMLDivElement | null>(null);
-  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const loadRunRef = useRef(0);
+  const ingestQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   const urlState = useMemo(() => new URLSearchParams(window.location.search), []);
 
@@ -89,55 +94,63 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
 
   const loadMessages = useCallback(
     async (search: string) => {
+      const loadRunId = loadRunRef.current + 1;
+      loadRunRef.current = loadRunId;
       const normalizedSearch = search.trim();
+      const unreadQuery = buildUnreadSearchQuery(normalizedSearch);
       setLoadingMessages(true);
-      setLoadingMore(false);
+      setLoadingProgress("Loading unread mail...");
       setError(null);
       setAppliedQuery(normalizedSearch);
+      setMessages([]);
       try {
-        const response = await api.listGmailMessages({
-          maxResults: PAGE_SIZE,
-          q: normalizedSearch || undefined,
-          labelIds: ["INBOX"]
-        });
-        setMessages(response.messages);
-        setNextPageToken(response.next_page_token);
-        setResultSizeEstimate(response.result_size_estimate);
+        let nextPageToken: string | null = null;
+        let combinedMessages: GmailMessageSummary[] = [];
+
+        do {
+          const response = await api.listGmailMessages({
+            maxResults: FETCH_PAGE_SIZE,
+            q: unreadQuery,
+            pageToken: nextPageToken || undefined
+          });
+          if (loadRunRef.current !== loadRunId) {
+            return;
+          }
+          combinedMessages = mergeMessagePages(combinedMessages, response.messages);
+          nextPageToken = response.next_page_token;
+          setMessages([...combinedMessages]);
+          setLoadingProgress(`Loaded ${combinedMessages.length} unread messages...`);
+          if (normalizedSearch === "" && response.messages.length > 0) {
+            const maxMessages = response.messages.length;
+            ingestQueueRef.current = ingestQueueRef.current
+              .catch(() => undefined)
+              .then(async () => {
+                await api.syncGmailInbox({
+                  maxMessages,
+                  q: UNREAD_QUERY,
+                  backfill: true
+                });
+              });
+          }
+        } while (nextPageToken);
+
         if (messagesScrollRef.current) {
           messagesScrollRef.current.scrollTop = 0;
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to list inbox messages.");
+        if (loadRunRef.current !== loadRunId) {
+          return;
+        }
+        setError(err instanceof Error ? err.message : "Failed to list unread messages.");
       } finally {
-        setLoadingMessages(false);
+        if (loadRunRef.current === loadRunId) {
+          setLoadingProgress(null);
+          setLoadingMessages(false);
+        }
       }
     },
     [api]
   );
-
-  const loadMoreMessages = useCallback(async () => {
-    if (!nextPageToken || loadingMessages || loadingMore) {
-      return;
-    }
-
-    setLoadingMore(true);
-    setError(null);
-    try {
-      const response = await api.listGmailMessages({
-        maxResults: PAGE_SIZE,
-        q: appliedQuery || undefined,
-        pageToken: nextPageToken,
-        labelIds: ["INBOX"]
-      });
-      setMessages((current) => mergeMessagePages(current, response.messages));
-      setNextPageToken(response.next_page_token);
-      setResultSizeEstimate((current) => response.result_size_estimate ?? current);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to list inbox messages.");
-    } finally {
-      setLoadingMore(false);
-    }
-  }, [api, appliedQuery, loadingMessages, loadingMore, nextPageToken]);
 
   const loadDetail = useCallback(
     async (messageId: string) => {
@@ -185,31 +198,6 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
     }
   }, [connection?.connected, loadMessages]);
 
-  useEffect(() => {
-    if (!nextPageToken || loadingMessages || loadingMore) {
-      return;
-    }
-    if (typeof IntersectionObserver === "undefined") {
-      return;
-    }
-    const scrollRoot = messagesScrollRef.current;
-    const sentinel = loadMoreRef.current;
-    if (!sentinel || !scrollRoot) {
-      return;
-    }
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          void loadMoreMessages();
-        }
-      },
-      { root: scrollRoot, rootMargin: "180px 0px" }
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [loadMoreMessages, loadingMessages, loadingMore, nextPageToken]);
-
   async function handleConnect() {
     setConnecting(true);
     setError(null);
@@ -223,14 +211,15 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
   }
 
   async function handleDisconnect() {
+    loadRunRef.current += 1;
+    ingestQueueRef.current = Promise.resolve();
     setError(null);
     try {
       const status = await api.disconnectGoogle();
       setConnection(status);
       setMessages([]);
       setSelectedMessage(null);
-      setNextPageToken(null);
-      setResultSizeEstimate(null);
+      setLoadingProgress(null);
       setAppliedQuery("");
       setQuery("");
     } catch (err) {
@@ -245,6 +234,12 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
     }
     await loadMessages(query);
   }
+
+  useEffect(() => {
+    return () => {
+      loadRunRef.current += 1;
+    };
+  }, []);
 
   if (loadingConnection) {
     return <p className="status">Loading Gmail connection...</p>;
@@ -295,7 +290,7 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
       <header className="page-header with-action">
         <div>
           <span className="section-kicker">Connected inbox</span>
-          <h2>Gmail Inbox</h2>
+          <h2>Unread Gmail</h2>
           <p>
             Connected as <strong>{connection.email ?? "unknown account"}</strong>
           </p>
@@ -312,7 +307,7 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
         <input
           type="text"
           value={query}
-          placeholder="Search inbox (e.g. interview OR recruiter)"
+          placeholder="Search unread mail (e.g. interview OR recruiter)"
           onChange={(event) => setQuery(event.target.value)}
           aria-label="Gmail Search Query"
         />
@@ -324,13 +319,11 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
       <div className="gmail-layout">
         <section className="panel">
           <header className="panel-header">
-            <h3>Inbox Messages</h3>
-            <span className="pill">
-              {resultSizeEstimate === null ? messages.length : `${messages.length}/${resultSizeEstimate}`}
-            </span>
+            <h3>Unread Messages</h3>
+            <span className="pill">{messages.length} loaded</span>
           </header>
           <div className="gmail-messages-scroll" ref={messagesScrollRef}>
-            {loadingMessages ? <p className="status">Loading inbox...</p> : null}
+            {loadingMessages ? <p className="status">{loadingProgress ?? "Loading all unread mail..."}</p> : null}
             {!loadingMessages && messages.length === 0 ? (
               <p className="empty">No messages returned for this query.</p>
             ) : (
@@ -359,18 +352,9 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
                 ))}
               </ul>
             )}
-            {loadingMore ? <p className="status">Loading more inbox messages...</p> : null}
-            {nextPageToken ? (
+            {!loadingMessages && appliedQuery === "" ? (
               <div className="panel-footer">
-                <button
-                  type="button"
-                  className="secondary"
-                  onClick={() => void loadMoreMessages()}
-                  disabled={loadingMessages || loadingMore}
-                >
-                  {loadingMore ? "Loading more..." : "Load more"}
-                </button>
-                <div ref={loadMoreRef} className="scroll-sentinel" aria-hidden="true" />
+                <p className="status">Showing all unread mail in the connected account.</p>
               </div>
             ) : null}
           </div>
