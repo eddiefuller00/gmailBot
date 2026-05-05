@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -8,7 +9,7 @@ from typing import Any
 from dateutil import parser as date_parser
 from pydantic import BaseModel, ValidationError
 
-from app.ai_runtime import clear_ai_error, get_openai_client, raise_ai_processing_error
+from app.ai_runtime import get_openai_client, raise_ai_processing_error, record_ai_success, run_openai_request
 from app.config import settings
 from app.profile_preferences import (
     profile_deprioritize_categories,
@@ -27,6 +28,10 @@ from app.response_intent import (
     is_no_reply_sender,
 )
 from app.schemas import ActionChannel, Category, EmailIngestItem, ExtractedMetadata, UserProfile
+
+
+EXTRACTION_MAX_COMPLETION_TOKENS = 220
+logger = logging.getLogger(__name__)
 
 
 CATEGORY_KEYWORDS: dict[str, list[str]] = {
@@ -98,12 +103,41 @@ NEWSLETTER_TERMS = [
     "roundup",
     "weekly update",
     "weekly digest",
+    "daily job alerts",
     "jobs picked for you",
     "recommended for you",
     "view all jobs",
     "you received this email because",
     "manage your preferences",
 ]
+
+GENERIC_JOB_MARKETING_TERMS = [
+    "jobs picked for you",
+    "recommended for you",
+    "recommended jobs",
+    "latest jobs",
+    "view all jobs",
+    "daily job alerts",
+]
+
+CONTENT_DIGEST_TERMS = [
+    "view this email in your browser",
+    "view in browser",
+    "read online",
+    "read in browser",
+    "top stories",
+    "morning briefing",
+    "manage your preferences",
+]
+
+CONTENT_DIGEST_SENDER_HINTS = {
+    "news",
+    "newsletter",
+    "digest",
+    "briefing",
+    "updates",
+    "alerts",
+}
 
 JOB_CONTEXT_TERMS = [
     "interview",
@@ -229,6 +263,31 @@ def _extract_company(from_email: str, subject: str, body: str) -> str | None:
 def _is_bulk_sender(from_email: str) -> bool:
     lower = from_email.lower()
     return is_no_reply_sender(from_email) or any(term in lower for term in BULK_SENDER_TERMS)
+
+
+def _sender_has_content_digest_hint(from_email: str) -> bool:
+    lower = from_email.lower().strip()
+    local_part = lower.split("@", 1)[0]
+    tokens = [token for token in re.split(r"[^a-z0-9]+", lower) if token]
+    return local_part.endswith("direct") or any(
+        token in CONTENT_DIGEST_SENDER_HINTS for token in tokens
+    )
+
+
+def _looks_like_content_digest(text: str, from_email: str) -> bool:
+    digest_hits = _count_any(text, CONTENT_DIGEST_TERMS) + _count_any(text, NEWSLETTER_TERMS)
+    if digest_hits >= 2:
+        return True
+    if digest_hits >= 1 and (_sender_has_content_digest_hint(from_email) or _is_bulk_sender(from_email)):
+        return True
+    return False
+
+
+def _looks_like_generic_job_digest(text: str, from_email: str) -> bool:
+    job_marketing_hits = _count_any(text, GENERIC_JOB_MARKETING_TERMS)
+    if job_marketing_hits == 0:
+        return False
+    return _is_bulk_sender(from_email) or not _strong_job_signal(text, from_email)
 
 
 def _append_reason(reason: str, message: str) -> str:
@@ -360,21 +419,31 @@ def _apply_response_intent_signals(
 
 def _heuristic_extract(email: EmailIngestItem, cleaned_body: str) -> ExtractedMetadata:
     text = f"{email.subject}\n{cleaned_body}"
+    lower_text = text.lower()
     signals = detect_response_intent(
         from_email=email.from_email,
         subject=email.subject,
         body=cleaned_body,
     )
-    action_required = any(token in text.lower() for token in ACTION_KEYWORDS)
+    action_required = any(token in lower_text for token in ACTION_KEYWORDS)
     if action_required and not signals.likely_needs_reply and (
         signals.no_reply_sender or signals.link_only_cta
     ):
         action_required = True
 
-    is_bulk = _is_bulk_sender(email.from_email) or _contains_any(text, NEWSLETTER_TERMS + MARKETING_TERMS)
+    digest_like = _looks_like_content_digest(lower_text, email.from_email)
+    generic_job_digest = _looks_like_generic_job_digest(lower_text, email.from_email)
+    is_bulk = (
+        _is_bulk_sender(email.from_email)
+        or digest_like
+        or generic_job_digest
+        or _contains_any(text, NEWSLETTER_TERMS + MARKETING_TERMS)
+    )
     category = _pick_category(text)
+    if digest_like or generic_job_digest:
+        category = "newsletter"
     if is_bulk and category in {"job", "school", "bill", "other"} and not _strong_job_signal(text, email.from_email):
-        if _contains_any(text, NEWSLETTER_TERMS):
+        if digest_like or generic_job_digest or _contains_any(text, NEWSLETTER_TERMS):
             category = "newsletter"
         elif _contains_any(text, MARKETING_TERMS):
             category = "promotion"
@@ -398,6 +467,34 @@ def _heuristic_extract(email: EmailIngestItem, cleaned_body: str) -> ExtractedMe
         ai_source="heuristic",
         prompt_version=EMAIL_EXTRACTION_PROMPT_VERSION,
         processing_version=PROCESSING_VERSION,
+    )
+
+
+def _should_short_circuit_bulk_heuristic(
+    *,
+    email: EmailIngestItem,
+    cleaned_body: str,
+    heuristic: ExtractedMetadata,
+) -> bool:
+    if heuristic.category not in {"promotion", "newsletter"}:
+        return False
+    if not heuristic.is_bulk or heuristic.action_required or heuristic.action_channel != "none":
+        return False
+
+    text = f"{email.subject}\n{cleaned_body}".lower()
+    if _strong_job_signal(text, email.from_email):
+        return False
+    if _contains_any(text, SCHOOL_CONTEXT_TERMS) or _contains_any(text, BILL_CONTEXT_TERMS):
+        return False
+
+    marketing_hits = _count_any(text, MARKETING_TERMS)
+    newsletter_hits = _count_any(text, NEWSLETTER_TERMS)
+    return bool(
+        marketing_hits
+        or newsletter_hits
+        or _looks_like_content_digest(text, email.from_email)
+        or _looks_like_generic_job_digest(text, email.from_email)
+        or _is_bulk_sender(email.from_email)
     )
 
 
@@ -462,18 +559,20 @@ def _llm_extract(
     try:
         client = get_openai_client()
         user_payload = build_extraction_user_payload(email, cleaned_body, profile)
-        completion = client.chat.completions.create(
-            model=settings.openai_chat_model,
-            temperature=settings.openai_chat_temperature,
-            top_p=settings.openai_chat_top_p,
-            frequency_penalty=settings.openai_chat_frequency_penalty,
-            presence_penalty=settings.openai_chat_presence_penalty,
-            max_completion_tokens=max(700, settings.openai_chat_max_tokens),
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": EMAIL_EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(user_payload)},
-            ],
+        completion = run_openai_request(
+            lambda: client.chat.completions.create(
+                model=settings.openai_chat_model,
+                temperature=settings.openai_chat_temperature,
+                top_p=settings.openai_chat_top_p,
+                frequency_penalty=settings.openai_chat_frequency_penalty,
+                presence_penalty=settings.openai_chat_presence_penalty,
+                max_completion_tokens=EXTRACTION_MAX_COMPLETION_TOKENS,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": EMAIL_EXTRACTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": json.dumps(user_payload)},
+                ],
+            )
         )
         raw = completion.choices[0].message.content or "{}"
         data: dict[str, Any] = json.loads(raw)
@@ -483,8 +582,19 @@ def _llm_extract(
             cleaned_body=cleaned_body,
         )
         if parsed is None:
-            raise ValueError("OpenAI returned an invalid extraction payload.")
-        clear_ai_error()
+            logger.warning(
+                "OpenAI returned an invalid extraction payload for %s; using heuristic fallback. Raw=%s",
+                email.external_id,
+                raw[:1000],
+            )
+            heuristic = _heuristic_extract(email, cleaned_body)
+            heuristic.reason = _append_reason(
+                heuristic.reason,
+                "LLM payload was invalid, so heuristic extraction was used.",
+            )
+            record_ai_success()
+            return heuristic
+        record_ai_success()
         return parsed
     except Exception as exc:
         raise_ai_processing_error("extraction", exc)
@@ -497,7 +607,16 @@ def extract_metadata(
     *,
     allow_fallback: bool = False,
 ) -> ExtractedMetadata:
-    base = _heuristic_extract(email, cleaned_body) if allow_fallback else _llm_extract(email, cleaned_body, profile)
+    heuristic = _heuristic_extract(email, cleaned_body)
+    base = (
+        heuristic
+        if allow_fallback or _should_short_circuit_bulk_heuristic(
+            email=email,
+            cleaned_body=cleaned_body,
+            heuristic=heuristic,
+        )
+        else _llm_extract(email, cleaned_body, profile)
+    )
     constrained = _apply_profile_constraints(
         email=email,
         cleaned_body=cleaned_body,

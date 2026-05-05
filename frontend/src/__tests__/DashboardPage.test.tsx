@@ -137,12 +137,12 @@ describe("DashboardPage", () => {
     await user.click(screen.getByRole("button", { name: "Backfill Unread" }));
 
     expect(syncGmailInbox).toHaveBeenCalledWith({
-      maxMessages: 500,
+      maxMessages: 100,
       q: "is:unread",
       backfill: true,
-      syncUntilComplete: true
+      syncUntilComplete: false
     });
-    expect(await screen.findByText("Unread backfill complete. Processed 312 emails.")).toBeInTheDocument();
+    expect(await screen.findByText("Synced 312 unread emails.")).toBeInTheDocument();
   });
 
   it("fills top priorities from important emails when action items are fewer than three", async () => {

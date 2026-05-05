@@ -16,6 +16,7 @@ def _state_value(key: str) -> tuple[str | None, object | None]:
 
 def get_capabilities() -> CapabilitiesResponse:
     openai_configured = bool(settings.openai_api_key)
+    openai_runtime_available = openai_available()
     gmail_oauth_configured = bool(
         settings.google_client_id
         and settings.google_client_secret
@@ -25,15 +26,23 @@ def get_capabilities() -> CapabilitiesResponse:
 
     last_sync_value, _ = _state_value("last_successful_sync_at")
     last_ai_error, last_ai_error_at = _state_value("last_ai_error")
+    last_ai_success_at, _ = _state_value("last_ai_success_at")
+
+    if openai_runtime_available and last_ai_error:
+        openai_message = "OpenAI is configured, but the last runtime call failed. Check runtime logs and retry."
+    elif openai_runtime_available and last_ai_success_at:
+        openai_message = "OpenAI is ready for ingestion, ranking, alerts, and Ask Inbox."
+    elif openai_runtime_available:
+        openai_message = (
+            "OpenAI is configured, but the runtime has not completed a successful model call yet."
+        )
+    else:
+        openai_message = "Set `OPENAI_API_KEY` to enable AI ranking, alerts, and Ask Inbox."
 
     openai_status = CapabilityStatus(
         configured=openai_configured,
-        available=openai_available(),
-        message=(
-            "OpenAI is ready for ingestion, ranking, alerts, and Ask Inbox."
-            if openai_available()
-            else "Set `OPENAI_API_KEY` to enable AI ranking, alerts, and Ask Inbox."
-        ),
+        available=openai_runtime_available,
+        message=openai_message,
     )
     gmail_status = CapabilityStatus(
         configured=gmail_oauth_configured,

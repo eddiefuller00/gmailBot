@@ -11,7 +11,7 @@ interface DashboardPageProps {
 
 const DEFAULT_AUTO_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const MIN_AUTO_SYNC_INTERVAL_MS = 60 * 1000;
-const FULL_BACKFILL_SYNC_MAX_MESSAGES = 500;
+const BACKFILL_BATCH_MAX_MESSAGES = 100;
 const RECENT_SYNC_MAX_MESSAGES = 50;
 const UNREAD_INBOX_QUERY = "is:unread";
 const ALERT_PREVIEW_COUNT = 3;
@@ -460,8 +460,7 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
             <button
               onClick={() =>
                 void syncConnectedGmail({
-                  maxMessages: FULL_BACKFILL_SYNC_MAX_MESSAGES,
-                  syncUntilComplete: true
+                  maxMessages: BACKFILL_BATCH_MAX_MESSAGES
                 })
               }
               disabled={!canSyncNow || syncing}

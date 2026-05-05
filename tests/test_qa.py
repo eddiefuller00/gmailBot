@@ -128,7 +128,7 @@ def test_answer_query_returns_cited_openai_response(monkeypatch) -> None:
             }
         ),
     )
-    monkeypatch.setattr(qa, "clear_ai_error", lambda: None)
+    monkeypatch.setattr(qa, "record_ai_success", lambda: None)
 
     response = qa.answer_query(
         "What deadlines do I have this week?",
