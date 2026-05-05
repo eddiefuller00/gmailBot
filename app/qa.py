@@ -5,10 +5,13 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from app.ai_runtime import clear_ai_error, get_openai_client, raise_ai_processing_error
+from app.ai_runtime import get_openai_client, raise_ai_processing_error, record_ai_success, run_openai_request
 from app.config import settings
 from app.prompting import ASK_INBOX_SYSTEM_PROMPT, build_qa_user_payload
 from app.schemas import ProcessedEmail, QAResponse, UserProfile
+
+
+QA_MAX_COMPLETION_TOKENS = 260
 
 
 class QACompletionPayload(BaseModel):
@@ -60,23 +63,25 @@ def answer_query(
     try:
         client = get_openai_client()
         payload = build_qa_user_payload(query=query, profile=profile, emails=candidates)
-        completion = client.chat.completions.create(
-            model=settings.openai_chat_model,
-            temperature=0,
-            top_p=1,
-            max_completion_tokens=min(900, settings.openai_chat_max_tokens + 250),
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": ASK_INBOX_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(payload)},
-            ],
+        completion = run_openai_request(
+            lambda: client.chat.completions.create(
+                model=settings.openai_chat_model,
+                temperature=0,
+                top_p=1,
+                max_completion_tokens=QA_MAX_COMPLETION_TOKENS,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": ASK_INBOX_SYSTEM_PROMPT},
+                    {"role": "user", "content": json.dumps(payload)},
+                ],
+            )
         )
         raw = completion.choices[0].message.content or "{}"
         parsed = parse_qa_payload(json.loads(raw), ranked_emails=candidates)
         if parsed is None:
             raise ValueError("OpenAI returned an invalid Ask Inbox payload.")
         answer, citations, supporting = parsed
-        clear_ai_error()
+        record_ai_success()
         return QAResponse(
             answer=answer,
             answer_mode="openai_rag",

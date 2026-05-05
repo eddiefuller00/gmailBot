@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Lock
+from time import perf_counter
 
 from app import db
 from app.ai_runtime import AIProcessingError, AIRuntimeError
@@ -52,6 +55,10 @@ NOISY_DASHBOARD_TERMS = (
     "deal",
 )
 PROFILE_SCORE_REFRESH_LOCK = Lock()
+EMBEDDING_BODY_PREVIEW_CHARS = 900
+QA_VECTOR_SCAN_LIMIT = 600
+GMAIL_DETAIL_FETCH_MAX_WORKERS = 8
+logger = logging.getLogger(__name__)
 
 
 def _dedupe_by_external_id(items: list[ProcessedEmail]) -> list[ProcessedEmail]:
@@ -89,6 +96,22 @@ def build_content_fingerprint(email: EmailIngestItem, cleaned_body: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def build_embedding_input(
+    email: EmailIngestItem,
+    cleaned_body: str,
+    summary: str,
+    reason: str,
+) -> str:
+    body_preview = cleaned_body.strip()[:EMBEDDING_BODY_PREVIEW_CHARS]
+    parts = [
+        email.subject.strip(),
+        summary.strip(),
+        reason.strip(),
+        body_preview,
+    ]
+    return "\n".join(part for part in parts if part)
+
+
 def process_email(
     email: EmailIngestItem,
     profile: UserProfile,
@@ -107,7 +130,9 @@ def process_email(
     metadata.scoring_breakdown = breakdown
     if not metadata.summary:
         metadata.summary = cleaned[:220]
-    embedding = embed_text(f"{email.subject}\n{cleaned}\n{metadata.summary}")
+    embedding = embed_text(
+        build_embedding_input(email, cleaned, metadata.summary, metadata.reason)
+    )
     now = datetime.now(timezone.utc)
     db.upsert_processed_email(
         external_id=email.external_id,
@@ -312,7 +337,7 @@ def build_dashboard(top_n: int = 5) -> DashboardResponse:
 
 
 def qa_over_inbox(query: str, limit: int = 8) -> QAResponse:
-    vectors = db.get_email_vectors(limit=2000)
+    vectors = db.get_email_vectors(limit=max(QA_VECTOR_SCAN_LIMIT, limit * 40))
     ranked = semantic_rank(query, vectors, limit=max(limit, 12))
     return answer_query(query, ranked, profile=db.get_profile())
 
@@ -361,6 +386,28 @@ def _gmail_sync_scope_key(query: str | None, label_ids: list[str]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _fetch_gmail_message_details_batch(
+    message_ids: list[str],
+) -> dict[str, GmailMessageDetail]:
+    if not message_ids:
+        return {}
+    if len(message_ids) == 1:
+        message_id = message_ids[0]
+        return {message_id: get_gmail_message_detail(message_id)}
+
+    details: dict[str, GmailMessageDetail] = {}
+    max_workers = min(GMAIL_DETAIL_FETCH_MAX_WORKERS, len(message_ids))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_message_id = {
+            executor.submit(get_gmail_message_detail, message_id): message_id
+            for message_id in message_ids
+        }
+        for future in as_completed(future_to_message_id):
+            message_id = future_to_message_id[future]
+            details[message_id] = future.result()
+    return details
 
 
 def _reuse_existing_processing(
@@ -420,6 +467,7 @@ def sync_connected_gmail(
     reset_backfill: bool = False,
     sync_until_complete: bool = False,
 ) -> GmailSyncResult:
+    started_at = perf_counter()
     if clear_non_gmail:
         db.delete_non_gmail_emails()
 
@@ -443,10 +491,13 @@ def sync_connected_gmail(
     ingested = 0
     seen_message_ids: set[str] = set()
     has_more = False
+    detail_fetch_seconds = 0.0
+    processing_seconds = 0.0
+    reused_count = 0
 
-    while sync_until_complete or ingested < max_messages:
+    while ingested < max_messages:
         remaining = max_messages - ingested
-        page_size = 50 if sync_until_complete else min(50, remaining)
+        page_size = min(50, remaining)
         if page_size <= 0:
             break
         message_ids, next_page_token = list_gmail_message_ids(
@@ -466,11 +517,15 @@ def sync_connected_gmail(
             has_more = False
             break
 
+        detail_started_at = perf_counter()
+        details_by_message_id = _fetch_gmail_message_details_batch(message_ids)
+        detail_fetch_seconds += perf_counter() - detail_started_at
+
         for message_id in message_ids:
             if message_id in seen_message_ids:
                 continue
             seen_message_ids.add(message_id)
-            detail = get_gmail_message_detail(message_id)
+            detail = details_by_message_id[message_id]
             ingest_item = _gmail_detail_to_ingest_item(detail)
             cleaned = clean_email_body(ingest_item.body)
             fingerprint = build_content_fingerprint(ingest_item, cleaned)
@@ -487,6 +542,7 @@ def sync_connected_gmail(
                     profile_fingerprint=profile_fingerprint,
                 )
             if not reused:
+                processing_started_at = perf_counter()
                 process_email(
                     ingest_item,
                     profile,
@@ -495,6 +551,9 @@ def sync_connected_gmail(
                     cleaned_body=cleaned,
                     content_fingerprint=fingerprint,
                 )
+                processing_seconds += perf_counter() - processing_started_at
+            else:
+                reused_count += 1
             ingested += 1
             if not sync_until_complete and ingested >= max_messages:
                 break
@@ -514,6 +573,19 @@ def sync_connected_gmail(
             break
         page_token = next_page_token
 
+    elapsed = perf_counter() - started_at
+    logger.info(
+        "Gmail sync completed: ingested=%s reused=%s has_more=%s backfill=%s sync_until_complete=%s "
+        "elapsed=%.2fs detail_fetch=%.2fs processing=%.2fs",
+        ingested,
+        reused_count,
+        has_more,
+        backfill,
+        sync_until_complete,
+        elapsed,
+        detail_fetch_seconds,
+        processing_seconds,
+    )
     db.set_runtime_state("last_successful_sync_at", datetime.now(timezone.utc).isoformat())
     return GmailSyncResult(
         ingested=ingested,

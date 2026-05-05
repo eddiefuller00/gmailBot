@@ -6,6 +6,7 @@ from app.extraction import (
     _apply_profile_constraints,
     _default_summary,
     extract_metadata,
+    _llm_extract,
     parse_llm_extraction_payload,
 )
 from app.prompting import (
@@ -87,17 +88,15 @@ def test_parse_llm_extraction_payload_rejects_invalid_category() -> None:
     assert parsed is None
 
 
-def test_build_extraction_user_payload_contains_versions_and_examples() -> None:
+def test_build_extraction_user_payload_contains_profile_policy_and_examples() -> None:
     email = _sample_email()
     profile = UserProfile(priorities=["jobs"], important_senders=["recruiters"])
     payload = build_extraction_user_payload(email, email.body, profile)
 
-    assert payload["prompt_version"] == EMAIL_EXTRACTION_PROMPT_VERSION
-    assert payload["processing_version"] == PROCESSING_VERSION
     assert "rules" in payload
     assert "examples" in payload
-    assert "output_schema" in payload
     assert payload["profile_policy"]["priority_categories"] == ["job"]
+    assert "profile" not in payload
 
 
 def test_build_extraction_user_payload_truncates_long_body() -> None:
@@ -109,8 +108,8 @@ def test_build_extraction_user_payload_truncates_long_body() -> None:
 
     body = payload["email"]["body"]
     assert len(body) <= MAX_EXTRACTION_BODY_CHARS + 10
-    assert body.startswith("A" * 2800)
-    assert body.endswith("B" * 1000)
+    assert body.startswith("A" * 1200)
+    assert body.endswith("B" * 500)
     assert " ... " in body
 
 
@@ -231,3 +230,80 @@ def test_extract_metadata_reclassifies_content_digest_as_newsletter() -> None:
     assert metadata.category == "newsletter"
     assert metadata.action_required is False
     assert metadata.is_bulk is True
+
+
+def test_extract_metadata_short_circuits_obvious_bulk_without_llm(monkeypatch) -> None:
+    email = EmailIngestItem(
+        external_id="e-6",
+        from_email="promo@tickets.com",
+        from_name="Tickets",
+        subject="50% off tickets tonight",
+        body="Final sale ends tonight. Unsubscribe in footer.",
+        received_at=datetime(2026, 4, 14, 12, 0, tzinfo=timezone.utc),
+        unread=True,
+    )
+    profile = UserProfile(priorities=["jobs"], deprioritize=["promotions"])
+
+    def fail_llm(*args, **kwargs):
+        raise AssertionError("LLM path should not run for obvious bulk promotions")
+
+    monkeypatch.setattr("app.extraction._llm_extract", fail_llm)
+
+    metadata = extract_metadata(email, email.body, profile)
+
+    assert metadata.ai_source == "heuristic"
+    assert metadata.category == "promotion"
+    assert metadata.action_required is False
+
+
+def test_extract_metadata_short_circuits_content_digest_without_llm(monkeypatch) -> None:
+    email = EmailIngestItem(
+        external_id="e-7",
+        from_email="news@email.microsoftstart.com",
+        from_name="Best of MSN",
+        subject="Every TV show getting cancelled in 2026 (full list)",
+        body="Read online. Best of MSN roundup. Manage your preferences.",
+        received_at=datetime(2026, 4, 14, 12, 0, tzinfo=timezone.utc),
+        unread=True,
+    )
+    profile = UserProfile(priorities=["jobs"])
+
+    def fail_llm(*args, **kwargs):
+        raise AssertionError("LLM path should not run for obvious content digests")
+
+    monkeypatch.setattr("app.extraction._llm_extract", fail_llm)
+
+    metadata = extract_metadata(email, email.body, profile)
+
+    assert metadata.ai_source == "heuristic"
+    assert metadata.category == "newsletter"
+    assert metadata.is_bulk is True
+
+
+def test_llm_extract_falls_back_to_heuristic_on_invalid_payload(monkeypatch) -> None:
+    email = _sample_email()
+    profile = UserProfile(priorities=["jobs"])
+
+    class _FakeCompletion:
+        choices = [type("Choice", (), {"message": type("Message", (), {"content": '{"oops":true}'})()})()]
+
+    class _FakeClient:
+        chat = type(
+            "Chat",
+            (),
+            {
+                "completions": type(
+                    "Completions",
+                    (),
+                    {"create": lambda *args, **kwargs: _FakeCompletion()},
+                )()
+            },
+        )()
+
+    monkeypatch.setattr("app.extraction.get_openai_client", lambda: _FakeClient())
+    monkeypatch.setattr("app.extraction.record_ai_success", lambda: None)
+
+    metadata = _llm_extract(email, email.body, profile)
+
+    assert metadata.ai_source == "heuristic"
+    assert "heuristic extraction was used" in metadata.reason.lower()

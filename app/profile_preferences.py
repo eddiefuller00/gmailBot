@@ -119,6 +119,7 @@ _IMPORTANT_SENDER_ALIAS_MAP: dict[str, str] = {
 }
 
 _WORD_PATTERN = re.compile(r"[a-z0-9]+")
+PROFILE_PROCESSING_VERSION = "profile-processing-v2"
 
 
 def _tokenize(value: str) -> list[str]:
@@ -232,6 +233,7 @@ def normalize_important_sender_preferences(values: list[str]) -> set[str]:
 
 def profile_processing_fingerprint(profile: UserProfile) -> str:
     normalized = {
+        "version": PROFILE_PROCESSING_VERSION,
         "role": sorted({" ".join(value.lower().split()) for value in profile.role if value.strip()}),
         "graduating_soon": bool(profile.graduating_soon),
         "priorities": sorted(expand_priority_categories(profile.priorities)),

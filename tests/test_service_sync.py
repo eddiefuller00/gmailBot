@@ -221,7 +221,7 @@ def test_sync_connected_gmail_backfill_complete_syncs_latest_window(monkeypatch)
     assert upserts == []
 
 
-def test_sync_connected_gmail_until_complete_exhausts_unread_backfill(monkeypatch) -> None:
+def test_sync_connected_gmail_until_complete_respects_max_messages(monkeypatch) -> None:
     monkeypatch.setattr(service.db, "get_profile", lambda: UserProfile())
     monkeypatch.setattr(service.db, "get_processed_email_record", lambda external_id: None)
     monkeypatch.setattr(service.db, "set_runtime_state", lambda key, value: None)
@@ -245,12 +245,12 @@ def test_sync_connected_gmail_until_complete_exhausts_unread_backfill(monkeypatc
         query: str | None,
         label_ids: list[str] | None,
     ) -> tuple[list[str], str | None]:
-        assert max_results == 50
+        assert max_results == 1
         assert query == "is:unread"
         assert label_ids == []
         page_calls.append(page_token)
         if page_token is None:
-            return ["m-1", "m-2"], "cursor-2"
+            return ["m-1"], "cursor-2"
         return ["m-3"], None
 
     monkeypatch.setattr(service, "list_gmail_message_ids", fake_list_gmail_message_ids)
@@ -285,12 +285,12 @@ def test_sync_connected_gmail_until_complete_exhausts_unread_backfill(monkeypatc
         sync_until_complete=True,
     )
 
-    assert result.ingested == 3
-    assert result.has_more is False
-    assert result.backfill_complete is True
-    assert processed_external_ids == ["gmail:m-1", "gmail:m-2", "gmail:m-3"]
-    assert page_calls == [None, "cursor-2"]
-    assert upserts == [("cursor-2", False), (None, True)]
+    assert result.ingested == 1
+    assert result.has_more is True
+    assert result.backfill_complete is False
+    assert processed_external_ids == ["gmail:m-1"]
+    assert page_calls == [None]
+    assert upserts == [("cursor-2", False)]
 
 
 def test_sync_connected_gmail_reuses_existing_processing_for_unchanged_message(monkeypatch) -> None:

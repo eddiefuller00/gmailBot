@@ -32,6 +32,36 @@ def test_scoring_prioritizes_job_interview_email() -> None:
     assert breakdown["sender_weight"] >= 8.0
 
 
+def test_scoring_prioritizes_direct_interview_scheduling_from_plain_sender() -> None:
+    profile = UserProfile(
+        role=["student", "job_seeker"],
+        priorities=["jobs", "school"],
+        important_senders=["recruiters"],
+        deprioritize=["promotions"],
+    )
+    email = EmailIngestItem(
+        external_id="e-1b",
+        from_email="statclass60@gmail.com",
+        subject="IMPORTANT: interview scheduling",
+        body=(
+            "Software Engineer Inc\n\n"
+            "Schedule your interview by May 5th, please pick a date between May 10th-13th."
+        ),
+        received_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    metadata = ExtractedMetadata(
+        category="job",
+        action_required=True,
+        deadline=datetime.now(timezone.utc) + timedelta(days=2),
+        confidence=0.95,
+        action_channel="read",
+    )
+    score, breakdown = compute_importance(email, metadata, profile)
+    assert score >= 8.0
+    assert breakdown["job_specificity_adjustment"] > 0
+    assert breakdown["content_evidence_adjustment"] > 0
+
+
 def test_scoring_deprioritizes_promotions() -> None:
     profile = UserProfile(priorities=["jobs"], deprioritize=["promotions"])
     email = EmailIngestItem(

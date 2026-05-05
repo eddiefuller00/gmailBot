@@ -59,6 +59,10 @@ STRONG_JOB_TERMS = [
     "assessment",
     "offer letter",
     "next steps",
+    "interview schedule",
+    "interview scheduling",
+    "schedule your interview",
+    "interview slot",
 ]
 
 CANDIDATE_CONTEXT_TERMS = [
@@ -327,6 +331,21 @@ def _recency_score(received_at: datetime) -> float:
 def _has_strong_job_signal(text: str, from_email: str) -> bool:
     lower = text.lower()
     if any(term in lower for term in STRONG_JOB_TERMS):
+        return True
+    if _matches_term(lower, "interview") and _contains_any(
+        lower,
+        [
+            "schedule",
+            "scheduling",
+            "confirm",
+            "availability",
+            "pick a date",
+            "pick a time",
+            "pick an interview slot",
+            "pick your interview slot",
+            "interview slot",
+        ],
+    ) > 0:
         return True
     if _matches_term(lower, "candidate") and _contains_any(lower, CANDIDATE_CONTEXT_TERMS) > 0:
         return True
