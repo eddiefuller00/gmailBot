@@ -6,7 +6,10 @@ import { CapabilityBanner } from "../components/CapabilityBanner";
 
 interface AskInboxPageProps {
   api?: ApiClient;
+  initialQuery?: string;
 }
+
+const DEFAULT_ASK_QUERY = "What should I handle first?";
 
 function SupportingEmails({
   emails,
@@ -39,8 +42,8 @@ function SupportingEmails({
   );
 }
 
-export function AskInboxPage({ api = apiClient }: AskInboxPageProps) {
-  const [query, setQuery] = useState("What should I handle first?");
+export function AskInboxPage({ api = apiClient, initialQuery }: AskInboxPageProps) {
+  const [query, setQuery] = useState(initialQuery ?? DEFAULT_ASK_QUERY);
   const [answer, setAnswer] = useState<string>("");
   const [answerMode, setAnswerMode] = useState<string>("");
   const [citations, setCitations] = useState<string[]>([]);
@@ -74,16 +77,21 @@ export function AskInboxPage({ api = apiClient }: AskInboxPageProps) {
     };
   }, [api]);
 
+  useEffect(() => {
+    setQuery(initialQuery ?? DEFAULT_ASK_QUERY);
+  }, [initialQuery]);
+
   async function handleAsk(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!query.trim() || !capabilities?.can_rank_inbox) {
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery || !capabilities?.can_rank_inbox) {
       return;
     }
 
     setLoading(true);
     setError(null);
     try {
-      const response = await api.askInbox(query.trim(), 8);
+      const response = await api.askInbox(normalizedQuery, 8);
       setAnswer(response.answer);
       setAnswerMode(response.answer_mode);
       setCitations(response.citations);
@@ -124,7 +132,7 @@ export function AskInboxPage({ api = apiClient }: AskInboxPageProps) {
           type="text"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="What should I handle first?"
+          placeholder={DEFAULT_ASK_QUERY}
           aria-label="Inbox Query"
         />
         <button type="submit" disabled={loading || !capabilities.can_rank_inbox}>

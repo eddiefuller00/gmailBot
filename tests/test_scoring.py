@@ -62,6 +62,78 @@ def test_scoring_prioritizes_direct_interview_scheduling_from_plain_sender() -> 
     assert breakdown["content_evidence_adjustment"] > 0
 
 
+def test_scoring_prioritizes_interview_calendar_invite_from_company_sender() -> None:
+    profile = UserProfile(
+        role=["student", "job_seeker"],
+        priorities=["jobs"],
+        important_senders=["recruiters"],
+        deprioritize=["promotions"],
+        highlight_deadlines=True,
+    )
+    email = EmailIngestItem(
+        external_id="e-1c",
+        from_email="michael@vibrantbt.com",
+        subject="Invitation: Eddie <> Vibrant Frontend Interview @ Fri May 8, 2026 2pm - 3pm",
+        body=(
+            "Eddie <> Vibrant Frontend Interview\n"
+            "Friday May 8, 2026 2pm - 3pm\n"
+            "Join with Google Meet\n"
+            "https://meet.google.com/room\n"
+            "Dial-in details included."
+        ),
+        received_at=datetime.now(timezone.utc) - timedelta(hours=1),
+    )
+    metadata = ExtractedMetadata(
+        category="job",
+        action_required=False,
+        deadline=datetime.now(timezone.utc) + timedelta(days=2),
+        event_date=datetime.now(timezone.utc) + timedelta(days=2, hours=1),
+        confidence=0.95,
+        action_channel="none",
+    )
+
+    score, breakdown = compute_importance(email, metadata, profile)
+
+    assert score >= 8.5
+    assert breakdown["job_specificity_adjustment"] > 0
+    assert breakdown["content_evidence_adjustment"] > 0
+    assert breakdown["job_sender_adjustment"] > 0
+
+
+def test_scoring_prioritizes_short_interview_thread_confirmation() -> None:
+    profile = UserProfile(
+        role=["student", "job_seeker"],
+        priorities=["jobs"],
+        important_senders=["recruiters"],
+        deprioritize=["promotions"],
+    )
+    email = EmailIngestItem(
+        external_id="e-1d",
+        from_email="michael@vibrantbt.com",
+        subject="Re: Vibrant Frontend Position Follow-up",
+        body=(
+            "Yes, 2pm Friday works for us. Will send invite.\n\n"
+            "On Mon, May 4, 2026 Michael wrote:\n"
+            "We'd like to move forward with the final interview step."
+        ),
+        received_at=datetime.now(timezone.utc) - timedelta(hours=2),
+    )
+    metadata = ExtractedMetadata(
+        category="job",
+        action_required=False,
+        event_date=datetime.now(timezone.utc) + timedelta(days=2),
+        confidence=0.95,
+        action_channel="none",
+    )
+
+    score, breakdown = compute_importance(email, metadata, profile)
+
+    assert score >= 8.5
+    assert breakdown["job_specificity_adjustment"] > 0
+    assert breakdown["content_evidence_adjustment"] > 0
+    assert breakdown["job_sender_adjustment"] > 0
+
+
 def test_scoring_deprioritizes_promotions() -> None:
     profile = UserProfile(priorities=["jobs"], deprioritize=["promotions"])
     email = EmailIngestItem(

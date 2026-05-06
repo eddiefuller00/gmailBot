@@ -63,6 +63,9 @@ STRONG_JOB_TERMS = [
     "interview scheduling",
     "schedule your interview",
     "interview slot",
+    "final interview",
+    "position follow-up",
+    "technical test",
 ]
 
 CANDIDATE_CONTEXT_TERMS = [
@@ -86,7 +89,53 @@ JOB_CONTEXT_TERMS = [
     "offer letter",
     "resume",
     "cv",
+    "position follow-up",
+    "final interview",
+    "google meet",
 ]
+
+JOB_SCHEDULING_TERMS = [
+    "schedule",
+    "scheduling",
+    "confirm",
+    "availability",
+    "pick a date",
+    "pick a time",
+    "pick a slot",
+    "pick an interview slot",
+    "pick your interview slot",
+    "interview slot",
+    "works for me",
+    "works for us",
+    "that works",
+    "that time works",
+    "best time for me",
+    "will send invite",
+    "send invite",
+    "move forward",
+]
+
+JOB_CALENDAR_TERMS = [
+    "google meet",
+    "join with google meet",
+    "dial-in details",
+    "join by phone",
+    "meet.google.com",
+]
+
+FREE_EMAIL_DOMAINS = {
+    "gmail.com",
+    "googlemail.com",
+    "yahoo.com",
+    "hotmail.com",
+    "outlook.com",
+    "live.com",
+    "icloud.com",
+    "me.com",
+    "aol.com",
+    "proton.me",
+    "protonmail.com",
+}
 
 GENERIC_JOB_MARKETING_TERMS = [
     "job market",
@@ -191,6 +240,20 @@ def _matches_term(lower_text: str, term: str) -> bool:
 def _is_bulk_sender(from_email: str) -> bool:
     lower = from_email.lower()
     return is_no_reply_sender(from_email) or any(term in lower for term in BULK_SENDER_TERMS)
+
+
+def _sender_domain(from_email: str) -> str:
+    lower = from_email.lower().strip()
+    if "@" not in lower:
+        return ""
+    return lower.split("@", 1)[1]
+
+
+def _is_company_domain_sender(from_email: str) -> bool:
+    domain = _sender_domain(from_email)
+    if not domain or domain in FREE_EMAIL_DOMAINS:
+        return False
+    return not _is_bulk_sender(from_email)
 
 
 def _sender_weight(from_email: str, profile: UserProfile) -> float:
@@ -334,23 +397,40 @@ def _has_strong_job_signal(text: str, from_email: str) -> bool:
         return True
     if _matches_term(lower, "interview") and _contains_any(
         lower,
-        [
-            "schedule",
-            "scheduling",
-            "confirm",
-            "availability",
-            "pick a date",
-            "pick a time",
-            "pick an interview slot",
-            "pick your interview slot",
-            "interview slot",
-        ],
+        JOB_SCHEDULING_TERMS,
     ) > 0:
+        return True
+    if _contains_any(lower, JOB_CALENDAR_TERMS) > 0 and _contains_any(
+        lower, ["interview", "invitation", "invite", "position follow-up"]
+    ) > 0:
+        return True
+    if _matches_term(lower, "re") and _contains_any(
+        lower, ["position follow-up", "final interview", "frontend position"]
+    ) > 0 and _contains_any(lower, JOB_SCHEDULING_TERMS) > 0:
         return True
     if _matches_term(lower, "candidate") and _contains_any(lower, CANDIDATE_CONTEXT_TERMS) > 0:
         return True
     sender = from_email.lower()
     return ("recruit" in sender or "talent" in sender) and not _is_bulk_sender(from_email)
+
+
+def _job_sender_adjustment(
+    email: EmailIngestItem,
+    metadata: ExtractedMetadata,
+    *,
+    priority_categories: set[str],
+) -> float:
+    if metadata.category != "job" or "job" not in priority_categories:
+        return 0.0
+    if not _is_company_domain_sender(email.from_email):
+        return 0.0
+
+    text = f"{email.subject}\n{email.body}".lower()
+    if _has_strong_job_signal(text, email.from_email):
+        return 1.2
+    if _contains_any(text, ["interview", "invite", "follow-up", "application"]) > 0:
+        return 0.7
+    return 0.0
 
 
 def _sender_has_content_digest_hint(from_email: str) -> bool:
@@ -560,6 +640,11 @@ def compute_importance(
         priority_categories=priority_categories,
         deprioritize_categories=deprioritize_categories,
     )
+    job_sender = _job_sender_adjustment(
+        email,
+        metadata,
+        priority_categories=priority_categories,
+    )
     reply_intent = _reply_intent_adjustment(email, metadata)
     action_channel = _action_channel_adjustment(metadata)
     response_signals = detect_response_intent(
@@ -582,6 +667,7 @@ def compute_importance(
         + job_specificity
         + content_evidence
         + profile_alignment
+        + job_sender
         + reply_intent
         + action_channel
     )
@@ -600,6 +686,7 @@ def compute_importance(
         "job_specificity_adjustment": round(job_specificity, 2),
         "content_evidence_adjustment": round(content_evidence, 2),
         "profile_alignment_adjustment": round(profile_alignment, 2),
+        "job_sender_adjustment": round(job_sender, 2),
         "reply_intent_adjustment": round(reply_intent, 2),
         "action_channel_adjustment": round(action_channel, 2),
         "no_reply_sender_signal": 1.0 if response_signals.no_reply_sender else 0.0,

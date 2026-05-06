@@ -57,3 +57,26 @@ def test_detect_response_intent_with_do_not_respond_language() -> None:
     assert signals.no_reply_sender is True
     assert signals.link_only_cta is True
     assert signals.likely_needs_reply is False
+
+
+def test_detect_response_intent_for_interview_scheduling_language() -> None:
+    signals = detect_response_intent(
+        from_email="michael@vibrantbt.com",
+        subject="Re: Vibrant Frontend Position Follow-up",
+        body=(
+            "We'd like to move forward with the final interview step. "
+            "Please pick a slot between 12-6 ET Monday through Friday this week."
+        ),
+    )
+    assert signals.no_reply_sender is False
+    assert signals.likely_needs_reply is True
+
+
+def test_detect_response_intent_for_availability_confirmation_language() -> None:
+    signals = detect_response_intent(
+        from_email="eddiefuller00@gmail.com",
+        subject="Re: Vibrant Frontend Position Follow-up",
+        body="The best time for me this week would be Friday at 2pm if that time works for you.",
+    )
+    assert signals.no_reply_sender is False
+    assert signals.likely_needs_reply is True

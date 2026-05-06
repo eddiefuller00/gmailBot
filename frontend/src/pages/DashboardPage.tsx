@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { apiClient, type ApiClient } from "../api/client";
+import { ApiError, apiClient, type ApiClient } from "../api/client";
 import type { AlertsResponse, CapabilitiesResponse, DashboardResponse, GoogleConnectionStatus } from "../api/types";
 import { CapabilityBanner } from "../components/CapabilityBanner";
 
 interface DashboardPageProps {
   api?: ApiClient;
   onNavigate?: (tab: "dashboard" | "ask" | "gmail" | "onboarding") => void;
+  onQuickPromptSelect?: (prompt: string) => void;
 }
 
 const DEFAULT_AUTO_SYNC_INTERVAL_MS = 5 * 60 * 1000;
@@ -14,10 +15,17 @@ const MIN_AUTO_SYNC_INTERVAL_MS = 60 * 1000;
 const BACKFILL_BATCH_MAX_MESSAGES = 100;
 const RECENT_SYNC_MAX_MESSAGES = 50;
 const UNREAD_INBOX_QUERY = "is:unread";
+const DASHBOARD_TOP_N = 100;
 const ALERT_PREVIEW_COUNT = 3;
-const PRIORITY_PREVIEW_COUNT = 3;
-const DEADLINE_PREVIEW_COUNT = 3;
+const JOB_THREAD_PREVIEW_COUNT = 3;
 const RECENT_IMPORTANT_PREVIEW_COUNT = 4;
+const QUICK_PROMPTS = [
+  "What are my deadlines this week?",
+  "Show recruiter emails",
+  "What needs a reply first?"
+] as const;
+const ACTIVE_JOB_THREAD_PATTERN =
+  /(interview|assessment|schedule|scheduling|availability|invite|follow[ -]?up|technical oa|recruit)/i;
 
 const parsedAutoSyncInterval = Number(
   import.meta.env.VITE_GMAIL_AUTO_SYNC_INTERVAL_MS ?? DEFAULT_AUTO_SYNC_INTERVAL_MS
@@ -122,18 +130,48 @@ function buildSyncStatus(
 
 type DashboardEmail = DashboardResponse["top_important_emails"][number];
 
+function dedupeEmailsByExternalId(emails: DashboardEmail[]): DashboardEmail[] {
+  const seen = new Set<string>();
+  const deduped: DashboardEmail[] = [];
+  for (const email of emails) {
+    if (seen.has(email.external_id)) {
+      continue;
+    }
+    seen.add(email.external_id);
+    deduped.push(email);
+  }
+  return deduped;
+}
+
+function dedupeEmailsByThread(emails: DashboardEmail[]): DashboardEmail[] {
+  const seen = new Set<string>();
+  const deduped: DashboardEmail[] = [];
+  for (const email of emails) {
+    const subjectKey = email.subject.replace(/^(re|fw|fwd):\s*/gi, "").trim().toLowerCase();
+    const key = email.gmail_thread_id?.trim() || subjectKey || email.external_id;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(email);
+  }
+  return deduped;
+}
+
 function EmailRows({
   title,
   emails,
   emptyMessage,
   actionLabel,
-  onAction
+  onAction,
+  scrollable = false
 }: {
   title: string;
   emails: DashboardEmail[];
   emptyMessage: string;
   actionLabel?: string;
   onAction?: () => void;
+  scrollable?: boolean;
 }) {
   return (
     <section className="dashboard-card">
@@ -149,7 +187,7 @@ function EmailRows({
       {emails.length === 0 ? (
         <p className="empty">{emptyMessage}</p>
       ) : (
-        <div className="stack-list">
+        <div className={scrollable ? "stack-list dashboard-scroll-list" : "stack-list"}>
           {emails.map((email) => {
             const badge = email.metadata.deadline
               ? "Due soon"
@@ -241,7 +279,7 @@ function SmartAlertsCard({
   );
 }
 
-export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProps) {
+export function DashboardPage({ api = apiClient, onNavigate, onQuickPromptSelect }: DashboardPageProps) {
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null);
   const [alerts, setAlerts] = useState<AlertsResponse | null>(null);
   const [capabilities, setCapabilities] = useState<CapabilitiesResponse | null>(null);
@@ -257,7 +295,7 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
     alerts: false,
     priorities: false,
     deadlines: false,
-    recent: false
+    reply: false
   });
 
   const toggleSection = useCallback(
@@ -272,13 +310,27 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
 
   const refreshRankedData = useCallback(async () => {
     const [dashboardData, alertsData, capabilitiesData] = await Promise.all([
-      api.getDashboard(),
+      api.getDashboard(DASHBOARD_TOP_N),
       api.getAlerts(),
       api.getCapabilities()
     ]);
     setDashboard(dashboardData);
     setAlerts(alertsData);
     setCapabilities(capabilitiesData);
+    setAutoSyncEnabled(Boolean(capabilitiesData.last_successful_sync_at));
+  }, [api]);
+
+  const refreshConnectionAfterUnauthorized = useCallback(async (err: unknown) => {
+    if (!(err instanceof ApiError) || err.status !== 401) {
+      return;
+    }
+
+    const [capabilitiesData, connectionData] = await Promise.all([
+      api.getCapabilities(),
+      api.getGoogleConnection()
+    ]);
+    setCapabilities(capabilitiesData);
+    setConnection(connectionData);
     setAutoSyncEnabled(Boolean(capabilitiesData.last_successful_sync_at));
   }, [api]);
 
@@ -308,6 +360,7 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
         setAutoSyncEnabled(true);
         setSyncStatus(buildSyncStatus(response, syncUntilComplete));
       } catch (err) {
+        await refreshConnectionAfterUnauthorized(err);
         setSyncWarning(
           err instanceof Error ? err.message : "Gmail sync failed while refreshing the dashboard."
         );
@@ -316,7 +369,7 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
         setSyncing(false);
       }
     },
-    [api, refreshRankedData]
+    [api, refreshConnectionAfterUnauthorized, refreshRankedData]
   );
 
   const load = useCallback(async () => {
@@ -339,7 +392,7 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
       }
 
       const [dashboardData, alertsData] = await Promise.all([
-        api.getDashboard(),
+        api.getDashboard(DASHBOARD_TOP_N),
         api.getAlerts()
       ]);
       setDashboard(dashboardData);
@@ -412,7 +465,7 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
     !capabilities.can_sync_gmail || !capabilities.can_rank_inbox || Boolean(capabilities.last_ai_error);
   const topPriorityPool = (() => {
     const actionFirst = [...dashboard.action_required];
-    if (actionFirst.length >= PRIORITY_PREVIEW_COUNT) {
+    if (actionFirst.length >= DASHBOARD_TOP_N) {
       return actionFirst;
     }
     const seen = new Set(actionFirst.map((email) => email.external_id));
@@ -426,18 +479,31 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
     }
     return filled;
   })();
-  const topPriorities = expandedSections.priorities
-    ? topPriorityPool
-    : topPriorityPool.slice(0, PRIORITY_PREVIEW_COUNT);
-  const priorityIds = new Set(topPriorities.map((email) => email.external_id));
-  const recentImportantPool = dashboard.top_important_emails
-    .filter((email) => !priorityIds.has(email.external_id))
-  const recentImportant = expandedSections.recent
-    ? recentImportantPool
-    : recentImportantPool.slice(0, RECENT_IMPORTANT_PREVIEW_COUNT);
-  const deadlineItems = expandedSections.deadlines
-    ? dashboard.upcoming_deadlines
-    : dashboard.upcoming_deadlines.slice(0, DEADLINE_PREVIEW_COUNT);
+  const topPriorities = topPriorityPool;
+  const needsReplyPool = dedupeEmailsByExternalId([
+    ...dashboard.action_required,
+    ...dashboard.top_important_emails,
+    ...dashboard.job_updates
+  ]).filter((email) => email.metadata.action_required && email.metadata.action_channel === "reply");
+  const needsReplyFirst = expandedSections.reply
+    ? needsReplyPool
+    : needsReplyPool.slice(0, RECENT_IMPORTANT_PREVIEW_COUNT);
+  const prioritizedJobThreads = dedupeEmailsByThread(
+    dashboard.job_updates.filter((email) => {
+      const evidence = [email.subject, email.metadata.summary, email.cleaned_body].join(" ");
+      return (
+        email.metadata.action_required ||
+        email.metadata.action_channel === "reply" ||
+        email.metadata.action_channel === "portal" ||
+        ACTIVE_JOB_THREAD_PATTERN.test(evidence)
+      );
+    })
+  );
+  const activeJobThreadsPool =
+    prioritizedJobThreads.length > 0 ? prioritizedJobThreads : dedupeEmailsByThread(dashboard.job_updates);
+  const activeJobThreads = expandedSections.deadlines
+    ? activeJobThreadsPool
+    : activeJobThreadsPool.slice(0, JOB_THREAD_PREVIEW_COUNT);
   const alertsPreview = expandedSections.alerts
     ? alerts.alerts
     : alerts.alerts.slice(0, ALERT_PREVIEW_COUNT);
@@ -499,24 +565,23 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
           title="Top Priorities"
           emails={topPriorities}
           emptyMessage="No priority items yet."
-          actionLabel={topPriorityPool.length > PRIORITY_PREVIEW_COUNT ? (expandedSections.priorities ? "Show less" : "View all") : undefined}
-          onAction={() => toggleSection("priorities")}
+          scrollable
         />
 
         <EmailRows
-          title="Upcoming Deadlines"
-          emails={deadlineItems}
-          emptyMessage="No upcoming deadlines."
-          actionLabel={dashboard.upcoming_deadlines.length > DEADLINE_PREVIEW_COUNT ? (expandedSections.deadlines ? "Show less" : "View all") : undefined}
+          title="Active Job Threads"
+          emails={activeJobThreads}
+          emptyMessage="No active job threads right now."
+          actionLabel={activeJobThreadsPool.length > JOB_THREAD_PREVIEW_COUNT ? (expandedSections.deadlines ? "Show less" : "View all") : undefined}
           onAction={() => toggleSection("deadlines")}
         />
 
         <EmailRows
-          title="Recent Important Emails"
-          emails={recentImportant}
-          emptyMessage="No important emails ranked yet."
-          actionLabel={recentImportantPool.length > RECENT_IMPORTANT_PREVIEW_COUNT ? (expandedSections.recent ? "Show less" : "View all") : undefined}
-          onAction={() => toggleSection("recent")}
+          title="Needs Reply First"
+          emails={needsReplyFirst}
+          emptyMessage="No reply-first items right now."
+          actionLabel={needsReplyPool.length > RECENT_IMPORTANT_PREVIEW_COUNT ? (expandedSections.reply ? "Show less" : "View all") : undefined}
+          onAction={() => toggleSection("reply")}
         />
 
         <section className="dashboard-card quick-ask-card">
@@ -530,9 +595,16 @@ export function DashboardPage({ api = apiClient, onNavigate }: DashboardPageProp
               Open Ask Inbox
             </button>
             <div className="quick-prompt-grid">
-              <span className="quick-pill">What are my deadlines this week?</span>
-              <span className="quick-pill">Show recruiter emails</span>
-              <span className="quick-pill">What needs a reply first?</span>
+              {QUICK_PROMPTS.map((prompt) => (
+                <button
+                  key={prompt}
+                  type="button"
+                  className="quick-pill"
+                  onClick={() => onQuickPromptSelect?.(prompt)}
+                >
+                  {prompt}
+                </button>
+              ))}
             </div>
           </div>
         </section>

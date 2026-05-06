@@ -48,6 +48,15 @@ REPLY_REQUEST_PATTERNS = [
     r"\bget back to (?:me|us)\b",
     r"\bemail (?:me|us)\b",
     r"\breply to this email\b",
+    r"\bshare (?:your |the )?availability\b",
+    r"\bsend (?:your )?availability\b",
+    r"\bwhat time works\b",
+    r"\bwhat works for you\b",
+    r"\bdoes .* work for you\b",
+    r"\bpick (?:a|your) (?:date|time|slot)\b",
+    r"\bchoose (?:a|your) (?:date|time|slot)\b",
+    r"\bconfirm (?:your )?(?:availability|time|slot)\b",
+    r"\bavailable time slots\b",
 ]
 
 LINK_CTA_TERMS = [
@@ -125,6 +134,34 @@ def detect_response_intent(
     no_reply_hint_in_body = _contains_pattern(lower, NO_REPLY_BODY_PATTERNS)
     explicit_reply_requested = _contains_pattern(lower, REPLY_REQUEST_PATTERNS)
     no_reply_sender = is_no_reply_sender(from_email) or no_reply_hint_in_body
+
+    scheduling_reply_like = any(
+        phrase in lower
+        for phrase in (
+            "works for me",
+            "works for us",
+            "that works for me",
+            "that works for us",
+            "best time for me",
+            "available any time",
+            "move forward with the final interview step",
+            "interview scheduling",
+        )
+    )
+    if not explicit_reply_requested and scheduling_reply_like and not no_reply_sender:
+        if any(
+            token in lower
+            for token in (
+                "interview",
+                "availability",
+                "invite",
+                "follow-up",
+                "technical oa",
+                "technical test",
+                "frontend position",
+            )
+        ):
+            explicit_reply_requested = True
 
     urls = URL_PATTERN.findall(text)
     url_count = len(urls)

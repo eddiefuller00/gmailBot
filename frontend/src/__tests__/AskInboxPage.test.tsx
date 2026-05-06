@@ -83,4 +83,36 @@ describe("AskInboxPage", () => {
     );
     expect(screen.getByText("Interview scheduling")).toBeInTheDocument();
   });
+
+  it("prefills the query from the selected dashboard prompt", async () => {
+    const api = {
+      getCapabilities: vi.fn().mockResolvedValue({
+        openai: { configured: true, available: true, message: "OpenAI ready" },
+        gmail_oauth: { configured: true, available: true, message: "OAuth ready" },
+        token_encryption: { configured: true, available: true, message: "Encryption ready" },
+        can_rank_inbox: true,
+        can_sync_gmail: true,
+        last_successful_sync_at: "2026-04-13T12:00:00Z",
+        last_ai_error: null,
+        last_ai_error_at: null
+      }),
+      getProfile: vi.fn(),
+      saveProfile: vi.fn(),
+      getDashboard: vi.fn(),
+      getAlerts: vi.fn(),
+      askInbox: vi.fn(),
+      ingestEmails: vi.fn(),
+      getGoogleConnection: vi.fn(),
+      getGoogleAuthUrl: vi.fn(),
+      disconnectGoogle: vi.fn(),
+      syncGmailInbox: vi.fn(),
+      listGmailMessages: vi.fn(),
+      getGmailMessageDetail: vi.fn()
+    };
+
+    render(<AskInboxPage api={api} initialQuery="Show recruiter emails" />);
+
+    const input = await screen.findByRole("textbox", { name: /inbox query/i });
+    expect(input).toHaveValue("Show recruiter emails");
+  });
 });

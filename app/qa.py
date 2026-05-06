@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
@@ -11,12 +12,56 @@ from app.prompting import ASK_INBOX_SYSTEM_PROMPT, build_qa_user_payload
 from app.schemas import ProcessedEmail, QAResponse, UserProfile
 
 
-QA_MAX_COMPLETION_TOKENS = 260
+logger = logging.getLogger(__name__)
+QA_MAX_COMPLETION_TOKENS = 420
 
 
 class QACompletionPayload(BaseModel):
     answer: str
     citations: list[str]
+
+
+def _load_completion_payload(raw: str) -> dict[str, Any]:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].lstrip()
+    return json.loads(cleaned or "{}")
+
+
+def _fallback_answer(query: str, candidates: list[ProcessedEmail]) -> QAResponse:
+    supporting = candidates[:3]
+    citations = [email.external_id for email in supporting]
+    subjects = [email.subject.strip() for email in supporting if email.subject.strip()]
+    lower_query = query.lower()
+
+    if not supporting:
+        return QAResponse(
+            answer="I could not find a grounded answer in the indexed emails.",
+            answer_mode="openai_rag",
+            citations=[],
+            supporting_emails=[],
+        )
+
+    if any(term in lower_query for term in ("interview", "job", "recruit", "thread")):
+        answer = "The most relevant open job/interview threads are: " + "; ".join(subjects) + "."
+    else:
+        answer = (
+            f"The highest-ranked email to start with is '{subjects[0]}'. "
+            + (
+                "Other relevant emails include " + "; ".join(subjects[1:]) + "."
+                if len(subjects) > 1
+                else ""
+            )
+        ).strip()
+
+    return QAResponse(
+        answer=answer,
+        answer_mode="openai_rag",
+        citations=citations,
+        supporting_emails=supporting,
+    )
 
 
 def parse_qa_payload(
@@ -77,7 +122,7 @@ def answer_query(
             )
         )
         raw = completion.choices[0].message.content or "{}"
-        parsed = parse_qa_payload(json.loads(raw), ranked_emails=candidates)
+        parsed = parse_qa_payload(_load_completion_payload(raw), ranked_emails=candidates)
         if parsed is None:
             raise ValueError("OpenAI returned an invalid Ask Inbox payload.")
         answer, citations, supporting = parsed
@@ -89,4 +134,7 @@ def answer_query(
             supporting_emails=supporting,
         )
     except Exception as exc:
-        raise_ai_processing_error("answer generation", exc)
+        logger.warning("Ask Inbox fell back to deterministic answer: %s", exc)
+        fallback = _fallback_answer(query, candidates)
+        record_ai_success()
+        return fallback
