@@ -43,6 +43,23 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _extract_google_oauth_error(response: httpx.Response) -> tuple[str | None, str | None]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, None
+
+    if not isinstance(payload, dict):
+        return None, None
+
+    error = payload.get("error")
+    description = payload.get("error_description")
+    return (
+        str(error) if isinstance(error, str) and error else None,
+        str(description) if isinstance(description, str) and description else None,
+    )
+
+
 def _require_google_oauth_config() -> None:
     missing = []
     if not settings.google_client_id:
@@ -111,8 +128,10 @@ def _http_post_form(url: str, form_data: dict[str, Any]) -> dict[str, Any]:
             headers={"Accept": "application/json"},
         )
     if response.status_code >= 400:
+        error, description = _extract_google_oauth_error(response)
+        detail = description or error or response.text
         raise GoogleOAuthFlowError(
-            f"Google token request failed ({response.status_code}): {response.text}"
+            f"Google token request failed ({response.status_code}): {detail}"
         )
     return response.json()
 
@@ -237,7 +256,24 @@ def _refresh_access_token(refresh_token: str) -> dict[str, Any]:
         "client_id": settings.google_client_id,
         "client_secret": settings.google_client_secret,
     }
-    return _http_post_form(settings.google_token_url, form_data)
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(
+            settings.google_token_url,
+            data=form_data,
+            headers={"Accept": "application/json"},
+        )
+    if response.status_code >= 400:
+        error, description = _extract_google_oauth_error(response)
+        if error == "invalid_grant":
+            disconnect_google_account()
+            raise GmailNotConnectedError(
+                "Google connection expired or was revoked. Reconnect your Gmail account."
+            )
+        detail = description or error or response.text
+        raise GoogleOAuthFlowError(
+            f"Google token request failed ({response.status_code}): {detail}"
+        )
+    return response.json()
 
 
 def handle_google_callback(*, code: str, state: str) -> str | None:

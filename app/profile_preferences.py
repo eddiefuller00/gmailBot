@@ -119,7 +119,7 @@ _IMPORTANT_SENDER_ALIAS_MAP: dict[str, str] = {
 }
 
 _WORD_PATTERN = re.compile(r"[a-z0-9]+")
-PROFILE_PROCESSING_VERSION = "profile-processing-v2"
+PROFILE_PROCESSING_VERSION = "profile-processing-v3"
 
 
 def _tokenize(value: str) -> list[str]:

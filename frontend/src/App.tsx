@@ -16,21 +16,36 @@ const tabs: Array<{ key: TabKey; label: string }> = [
 
 export function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("dashboard");
+  const [askInitialQuery, setAskInitialQuery] = useState<string | undefined>(undefined);
+
+  function navigateToTab(tab: TabKey) {
+    if (tab !== "ask") {
+      setAskInitialQuery(undefined);
+    } else {
+      setAskInitialQuery(undefined);
+    }
+    setActiveTab(tab);
+  }
+
+  function openAskWithPrompt(prompt: string) {
+    setAskInitialQuery(prompt);
+    setActiveTab("ask");
+  }
 
   const panel = useMemo(() => {
     switch (activeTab) {
       case "onboarding":
         return <OnboardingPage />;
       case "dashboard":
-        return <DashboardPage onNavigate={setActiveTab} />;
+        return <DashboardPage onNavigate={navigateToTab} onQuickPromptSelect={openAskWithPrompt} />;
       case "ask":
-        return <AskInboxPage />;
+        return <AskInboxPage initialQuery={askInitialQuery} />;
       case "gmail":
         return <GmailPage />;
       default:
         return null;
     }
-  }, [activeTab]);
+  }, [activeTab, askInitialQuery]);
 
   return (
     <div className="app-shell">
@@ -51,7 +66,7 @@ export function App() {
               <button
                 key={tab.key}
                 className={tab.key === activeTab ? "active" : ""}
-                onClick={() => setActiveTab(tab.key)}
+                onClick={() => navigateToTab(tab.key)}
                 type="button"
               >
                 {tab.label}
@@ -61,7 +76,7 @@ export function App() {
 
           <div className="topbar-status">
             <span className="status-chip ready">AI Ready</span>
-            <button type="button" className="avatar-chip" onClick={() => setActiveTab("onboarding")}>
+            <button type="button" className="avatar-chip" onClick={() => navigateToTab("onboarding")}>
               EW
             </button>
           </div>

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { apiClient, type ApiClient } from "../api/client";
+import { ApiError, apiClient, type ApiClient } from "../api/client";
 import type {
   CapabilitiesResponse,
   GmailMessageDetail,
@@ -92,6 +92,25 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
     }
   }, [api]);
 
+  const syncConnectionAfterAuthFailure = useCallback(async (err: unknown) => {
+    if (!(err instanceof ApiError) || err.status !== 401) {
+      return;
+    }
+
+    const [status, capabilityData] = await Promise.all([
+      api.getGoogleConnection(),
+      api.getCapabilities()
+    ]);
+    setConnection(status);
+    setCapabilities(capabilityData);
+    if (!status.connected) {
+      setMessages([]);
+      setSelectedMessage(null);
+      setAppliedQuery("");
+      setLoadingProgress(null);
+    }
+  }, [api]);
+
   const loadMessages = useCallback(
     async (search: string) => {
       const loadRunId = loadRunRef.current + 1;
@@ -141,6 +160,7 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
         if (loadRunRef.current !== loadRunId) {
           return;
         }
+        await syncConnectionAfterAuthFailure(err);
         setError(err instanceof Error ? err.message : "Failed to list unread messages.");
       } finally {
         if (loadRunRef.current === loadRunId) {
@@ -149,7 +169,7 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
         }
       }
     },
-    [api]
+    [api, syncConnectionAfterAuthFailure]
   );
 
   const loadDetail = useCallback(
@@ -160,12 +180,13 @@ export function GmailPage({ api = apiClient }: GmailPageProps) {
         const detail = await api.getGmailMessageDetail(messageId);
         setSelectedMessage(detail);
       } catch (err) {
+        await syncConnectionAfterAuthFailure(err);
         setError(err instanceof Error ? err.message : "Failed to fetch message detail.");
       } finally {
         setLoadingDetail(false);
       }
     },
-    [api]
+    [api, syncConnectionAfterAuthFailure]
   );
 
   useEffect(() => {

@@ -350,6 +350,12 @@ textarea {
   gap: 0.68rem;
 }
 
+.dashboard-scroll-list {
+  max-height: 34rem;
+  overflow-y: auto;
+  padding-right: 0.15rem;
+}
+
 .row-item {
   display: flex;
   align-items: flex-start;
@@ -494,12 +500,26 @@ textarea {
 }
 
 .quick-pill {
+  appearance: none;
   border: 1px solid var(--line);
   border-radius: 999px;
   padding: 0.4rem 0.68rem;
   background: var(--surface);
   color: #627588;
   font-size: 0.78rem;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.quick-pill:hover {
+  border-color: color-mix(in srgb, var(--primary) 25%, var(--line));
+  color: var(--primary);
+}
+
+.quick-pill:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--primary) 24%, transparent);
+  outline-offset: 2px;
 }
 
 .panel,

@@ -42,6 +42,16 @@ function buildEmail(id: number, subject: string): ProcessedEmail {
   };
 }
 
+function buildEmailWithActionChannel(
+  id: number,
+  subject: string,
+  actionChannel: ProcessedEmail["metadata"]["action_channel"]
+): ProcessedEmail {
+  const email = buildEmail(id, subject);
+  email.metadata.action_channel = actionChannel;
+  return email;
+}
+
 function buildApi(overrides: Partial<ApiClient> = {}): ApiClient {
   return {
     getCapabilities: vi.fn().mockResolvedValue({
@@ -107,8 +117,9 @@ describe("DashboardPage", () => {
 
     render(<DashboardPage api={api} />);
 
-    expect(await screen.findByText("Interview schedule")).toBeInTheDocument();
+    expect(await screen.findAllByText("Interview schedule")).not.toHaveLength(0);
     expect(screen.getByText("You have 3 important unread emails.")).toBeInTheDocument();
+    expect(api.getDashboard).toHaveBeenCalledWith(100);
   });
 
   it("backs up the full unread inbox on demand", async () => {
@@ -133,7 +144,7 @@ describe("DashboardPage", () => {
 
     render(<DashboardPage api={api} />);
 
-    await screen.findByText("Interview schedule");
+    await screen.findAllByText("Interview schedule");
     await user.click(screen.getByRole("button", { name: "Backfill Unread" }));
 
     expect(syncGmailInbox).toHaveBeenCalledWith({
@@ -166,13 +177,15 @@ describe("DashboardPage", () => {
 
     render(<DashboardPage api={api} />);
 
-    expect(await screen.findByText("BlackRock application receipt")).toBeInTheDocument();
-    expect(screen.getByText("BlackRock application receipt 2")).toBeInTheDocument();
-    expect(screen.getByText("Interview scheduling")).toBeInTheDocument();
+    const heading = await screen.findByRole("heading", { name: "Top Priorities" });
+    const card = heading.closest("section");
+    expect(card).not.toBeNull();
+    expect(within(card as HTMLElement).getByText("BlackRock application receipt")).toBeInTheDocument();
+    expect(within(card as HTMLElement).getByText("BlackRock application receipt 2")).toBeInTheDocument();
+    expect(within(card as HTMLElement).getByText("Interview scheduling")).toBeInTheDocument();
   });
 
-  it("expands recent important emails when view all is clicked", async () => {
-    const user = userEvent.setup();
+  it("shows overflow important emails directly in top priorities", async () => {
     const api = buildApi({
       getDashboard: vi.fn().mockResolvedValue({
         top_important_emails: [
@@ -194,18 +207,9 @@ describe("DashboardPage", () => {
 
     render(<DashboardPage api={api} />);
 
-    await screen.findByText("Interview scheduling");
-    expect(screen.queryByText("Hidden until expanded")).not.toBeInTheDocument();
-
-    const recentImportantHeading = screen.getByRole("heading", { name: "Recent Important Emails" });
-    const recentImportantCard = recentImportantHeading.closest("section");
-    expect(recentImportantCard).not.toBeNull();
-
-    const viewAllButton = within(recentImportantCard as HTMLElement).getByRole("button", { name: "View all" });
-    await user.click(viewAllButton);
-
+    expect(await screen.findAllByText("Interview scheduling")).not.toHaveLength(0);
     expect(screen.getByText("Hidden until expanded")).toBeInTheDocument();
-    expect(within(recentImportantCard as HTMLElement).getByRole("button", { name: "Show less" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Needs Reply First" })).toBeInTheDocument();
   });
 
   it("renders an open in gmail link for dashboard emails", async () => {
@@ -213,8 +217,125 @@ describe("DashboardPage", () => {
 
     render(<DashboardPage api={api} />);
 
-    expect(await screen.findByText("Interview schedule")).toBeInTheDocument();
-    const gmailLink = screen.getByRole("link", { name: "Open in Gmail" });
+    const heading = await screen.findByRole("heading", { name: "Top Priorities" });
+    const card = heading.closest("section");
+    expect(card).not.toBeNull();
+    const gmailLink = within(card as HTMLElement).getByRole("link", { name: "Open in Gmail" });
     expect(gmailLink).toHaveAttribute("href", "https://mail.google.com/mail/u/0/#all/thread-1");
+  });
+
+  it("shows all top priorities in a scrollable container", async () => {
+    const api = buildApi({
+      getDashboard: vi.fn().mockResolvedValue({
+        top_important_emails: [
+          buildEmail(1, "Interview scheduling"),
+          buildEmail(2, "Recruiter follow-up"),
+          buildEmail(3, "Assessment due"),
+          buildEmail(4, "Offer update")
+        ],
+        upcoming_deadlines: [],
+        upcoming_events: [],
+        job_updates: [],
+        action_required: [buildEmail(10, "Reply to hiring manager")]
+      })
+    });
+
+    render(<DashboardPage api={api} />);
+
+    const heading = await screen.findByRole("heading", { name: "Top Priorities" });
+    const card = heading.closest("section");
+    expect(card).not.toBeNull();
+    expect(screen.getByText("Offer update")).toBeInTheDocument();
+    expect(within(card as HTMLElement).queryByRole("button", { name: /view all|show less/i })).not.toBeInTheDocument();
+    const scrollRegion = (card as HTMLElement).querySelector(".dashboard-scroll-list");
+    expect(scrollRegion).not.toBeNull();
+  });
+
+  it("shows only reply-needed items in needs reply first", async () => {
+    const user = userEvent.setup();
+    const api = buildApi({
+      getDashboard: vi.fn().mockResolvedValue({
+        top_important_emails: [buildEmail(1, "Interview scheduling")],
+        upcoming_deadlines: [],
+        upcoming_events: [],
+        job_updates: [],
+        action_required: [
+          buildEmailWithActionChannel(10, "Reply to recruiter", "reply"),
+          buildEmailWithActionChannel(11, "Complete coding assessment", "portal"),
+          buildEmailWithActionChannel(12, "Read prep packet", "read"),
+          buildEmailWithActionChannel(13, "Confirm interview slot", "reply"),
+          buildEmailWithActionChannel(14, "Send availability", "reply"),
+          buildEmailWithActionChannel(15, "Reply to hiring manager", "reply"),
+          buildEmailWithActionChannel(16, "Overflow reply item", "reply")
+        ]
+      })
+    });
+
+    render(<DashboardPage api={api} />);
+
+    const heading = await screen.findByRole("heading", { name: "Needs Reply First" });
+    const card = heading.closest("section");
+    expect(card).not.toBeNull();
+
+    expect(within(card as HTMLElement).getByText("Reply to recruiter")).toBeInTheDocument();
+    expect(within(card as HTMLElement).getByText("Confirm interview slot")).toBeInTheDocument();
+    expect(within(card as HTMLElement).queryByText("Complete coding assessment")).not.toBeInTheDocument();
+    expect(within(card as HTMLElement).queryByText("Read prep packet")).not.toBeInTheDocument();
+    expect(within(card as HTMLElement).queryByText("Overflow reply item")).not.toBeInTheDocument();
+
+    await user.click(within(card as HTMLElement).getByRole("button", { name: "View all" }));
+
+    expect(within(card as HTMLElement).getByText("Overflow reply item")).toBeInTheDocument();
+    expect(within(card as HTMLElement).getByRole("button", { name: "Show less" })).toBeInTheDocument();
+  });
+
+  it("sends quick ask prompt selections to Ask Inbox", async () => {
+    const user = userEvent.setup();
+    const onQuickPromptSelect = vi.fn();
+    const api = buildApi();
+
+    render(<DashboardPage api={api} onQuickPromptSelect={onQuickPromptSelect} />);
+
+    await screen.findAllByText("Interview schedule");
+    await user.click(screen.getByRole("button", { name: "Show recruiter emails" }));
+
+    expect(onQuickPromptSelect).toHaveBeenCalledWith("Show recruiter emails");
+  });
+
+  it("replaces the empty deadlines lane with deduped active job threads", async () => {
+    const followUpOne = buildEmail(20, "Re: Vibrant Frontend Position Follow-up");
+    const followUpTwo = buildEmail(21, "Re: Vibrant Frontend Position Follow-up");
+    const technicalInterview = buildEmail(22, "IMPORTANT: Technical OA interview");
+    const invitation = buildEmail(23, "Invitation: Frontend interview");
+    followUpOne.gmail_thread_id = "thread-follow-up";
+    followUpTwo.gmail_thread_id = "thread-follow-up";
+    technicalInterview.gmail_thread_id = "thread-technical";
+    invitation.gmail_thread_id = "thread-invite";
+
+    const api = buildApi({
+      getDashboard: vi.fn().mockResolvedValue({
+        top_important_emails: [buildEmail(1, "Interview scheduling")],
+        upcoming_deadlines: [],
+        upcoming_events: [],
+        job_updates: [
+          followUpOne,
+          followUpTwo,
+          technicalInterview,
+          invitation
+        ],
+        action_required: []
+      })
+    });
+
+    render(<DashboardPage api={api} />);
+
+    const heading = await screen.findByRole("heading", { name: "Active Job Threads" });
+    const card = heading.closest("section");
+    expect(card).not.toBeNull();
+    expect(within(card as HTMLElement).getByText("Re: Vibrant Frontend Position Follow-up")).toBeInTheDocument();
+    expect(within(card as HTMLElement).getByText("IMPORTANT: Technical OA interview")).toBeInTheDocument();
+    expect(
+      within(card as HTMLElement).queryAllByText("Re: Vibrant Frontend Position Follow-up")
+    ).toHaveLength(1);
   });
 });

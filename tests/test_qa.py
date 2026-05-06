@@ -45,18 +45,19 @@ def _make_email(
 
 
 class _FakeCompletion:
-    def __init__(self, payload: dict[str, object]):
+    def __init__(self, payload: dict[str, object] | str):
+        content = payload if isinstance(payload, str) else json.dumps(payload)
         self.choices = [
             type(
                 "Choice",
                 (),
-                {"message": type("Message", (), {"content": json.dumps(payload)})()},
+                {"message": type("Message", (), {"content": content})()},
             )()
         ]
 
 
 class _FakeClient:
-    def __init__(self, payload: dict[str, object]):
+    def __init__(self, payload: dict[str, object] | str):
         self.chat = type(
             "Chat",
             (),
@@ -138,4 +139,38 @@ def test_answer_query_returns_cited_openai_response(monkeypatch) -> None:
 
     assert response.answer_mode == "openai_rag"
     assert response.citations == ["gmail:1"]
+    assert response.supporting_emails[0].external_id == "gmail:1"
+
+
+def test_answer_query_falls_back_when_openai_returns_malformed_json(monkeypatch) -> None:
+    emails = [
+        _make_email(
+            eid="gmail:1",
+            subject="Re: Vibrant Frontend Position Follow-up",
+            from_email="talent@company.com",
+            category="job",
+            action_required=True,
+        ),
+        _make_email(
+            eid="gmail:2",
+            subject="Invitation: Frontend interview",
+            from_email="recruiter@company.com",
+            category="job",
+        ),
+    ]
+    monkeypatch.setattr(
+        qa,
+        "get_openai_client",
+        lambda: _FakeClient('{"answer":"The most relevant thread is'),
+    )
+    monkeypatch.setattr(qa, "record_ai_success", lambda: None)
+
+    response = qa.answer_query(
+        "what open job interview related threads do i have in my inbox?",
+        emails,
+        profile=UserProfile(priorities=["jobs"]),
+    )
+
+    assert "job/interview threads" in response.answer
+    assert response.citations == ["gmail:1", "gmail:2"]
     assert response.supporting_emails[0].external_id == "gmail:1"

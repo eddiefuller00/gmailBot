@@ -23,6 +23,7 @@ from app.gmail_integration import (
     handle_google_callback,
     list_gmail_messages,
 )
+from app.session_logs import initialize_session_logs, log_ask_inbox_interaction
 from app.schemas import (
     AlertsResponse,
     CapabilitiesResponse,
@@ -42,6 +43,7 @@ from app.schemas import (
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init_db()
+    initialize_session_logs()
     yield
 
 
@@ -114,7 +116,7 @@ def list_emails(limit: int = Query(default=50, ge=1, le=5000)) -> list[Processed
 
 
 @app.get("/dashboard")
-def dashboard(top_n: int = Query(default=5, ge=1, le=20)):
+def dashboard(top_n: int = Query(default=5, ge=1, le=200)):
     _require_ai_capability()
     try:
         return service.build_dashboard(top_n=top_n)
@@ -126,7 +128,9 @@ def dashboard(top_n: int = Query(default=5, ge=1, le=20)):
 def qa(request: QARequest) -> QAResponse:
     _require_ai_capability()
     try:
-        return service.qa_over_inbox(request.query, request.limit)
+        response = service.qa_over_inbox(request.query, request.limit)
+        log_ask_inbox_interaction(request.query, response.answer)
+        return response
     except (AIRuntimeError, AIProcessingError) as exc:
         _raise_ai_http_error(exc)
 

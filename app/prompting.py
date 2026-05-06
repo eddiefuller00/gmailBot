@@ -12,7 +12,7 @@ from app.schemas import EmailIngestItem, ProcessedEmail, UserProfile
 
 EMAIL_EXTRACTION_PROMPT_VERSION = "email-extraction-v3"
 ASK_INBOX_PROMPT_VERSION = "ask-inbox-v1"
-PROCESSING_VERSION = "processing-v3"
+PROCESSING_VERSION = "processing-v4"
 MAX_EXTRACTION_BODY_CHARS = 1800
 EXTRACTION_BODY_HEAD_CHARS = 1200
 EXTRACTION_BODY_TAIL_CHARS = 500
