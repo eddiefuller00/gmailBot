@@ -57,6 +57,7 @@ The production path is:
 - Backend: Python, FastAPI, SQLite
 - Frontend: React, Vite, TypeScript
 - LLM / retrieval: OpenAI chat completions + embeddings
+- Integrations: Gmail API via Google OAuth with local token encryption support
 
 ## Functional Code Path
 Core files for graders:
@@ -67,6 +68,8 @@ Core files for graders:
 - `app/scoring.py`: weighted importance scoring
 - `app/retrieval.py`: embedding + semantic ranking
 - `app/qa.py`: grounded Ask Inbox answers with citations
+- `app/gmail_integration.py`: Google OAuth, Gmail fetch, token refresh, and reconnect handling
+- `app/session_logs.py`: per-session Ask Inbox prompt/output log written under `logs/`
 - `app/db.py`: SQLite persistence
 - `app/prompting.py`: system prompt, rules, few-shot examples, and payload builders
 - `frontend/src/pages/DashboardPage.tsx`: ranked dashboard UI
@@ -115,6 +118,7 @@ Frontend runs on `http://127.0.0.1:5173`.
 - `GOOGLE_CLIENT_SECRET`
 - `GOOGLE_REDIRECT_URI`
 - `TOKEN_ENCRYPTION_KEY`
+- `ALLOW_INSECURE_TOKEN_STORAGE` (optional; defaults to `false`)
 - `VITE_GMAIL_AUTO_SYNC_INTERVAL_MS` (frontend process env, min `60000`, default `300000`)
 
 ## Tests
@@ -215,7 +219,7 @@ Sample output:
 ```
 
 Suggested screenshot for submission if you want one:
-- Dashboard page showing `Top Priorities`, `Smart Alerts`, and the Gmail-connected sync controls
+- Dashboard page showing `Top Priorities`, `Smart Alerts`, `Needs Reply First`, and the Gmail-connected sync controls
 
 ### 4. Ask an inbox question
 Sample question:
@@ -238,38 +242,45 @@ Suggested screenshot for submission if you want one:
 Testing used both automated regression tests and live manual runs against the local UI/API.
 
 Automated coverage summary:
-- Backend: `46` tests in `tests/`
-- Frontend: `10` tests in `frontend/src/__tests__/`
+- Backend: `66` tests in `tests/`
+- Frontend: `15` tests in `frontend/src/__tests__/`
 
 Representative cases covered:
 - recruiter email vs. generic job digest: `tests/test_extraction.py`, `tests/test_scoring.py`
 - urgent promotion vs. real deadline: `tests/test_scoring.py`, `tests/test_alerts.py`, `tests/test_dashboard_service.py`
 - grounded Q&A with citations: `tests/test_qa.py`
 - Gmail sync and Gmail-backed persistence behavior: `tests/test_service_sync.py`
-- dashboard display behavior and expansion controls: `frontend/src/__tests__/DashboardPage.test.tsx`
+- revoked Gmail token handling and reconnect behavior: `tests/test_gmail_integration.py`
+- Ask Inbox session log file behavior: `tests/test_session_logs.py`
+- dashboard display behavior, scrollable priorities, reply queue, and active job threads: `frontend/src/__tests__/DashboardPage.test.tsx`
 
 Manual validation highlights:
 - connected Gmail sync and unread backfill
+- revoked Gmail token fallback to reconnect flow
 - dashboard ranking after onboarding changes
 - Ask Inbox grounded answers over stored inbox data
+- Ask Inbox request logging to `logs/ask_inbox_session.jsonl`
 - filtering/removal of legacy sample rows once Gmail is connected
 
 ## Safety / Ethics Note
-- Privacy risk from Gmail data: the app stores raw email text, structured metadata, and embeddings locally in SQLite. A real deployment would need stronger secrets management, access control, and retention policies.
+- Privacy risk from Gmail data: the app stores raw email text, structured metadata, embeddings, and Ask Inbox session logs locally on disk. A real deployment would need stronger secrets management, access control, retention policies, and clearer logging controls.
 - False positives / false urgency: an LLM can overreact to marketing language or article headlines if prompts and scoring are weak. The system now counters this with profile-aware prompting and conservative scoring rules.
 - Personalization bias from user profile: onboarding choices shape what is considered important, which can hide useful but non-priority messages or overweight a user's stated interests.
 - Incomplete prompt-injection protection: the app does not yet have a full adversarial content sanitization layer for email bodies before LLM processing.
+- OAuth token handling: Gmail tokens are stored locally and are intended to be encrypted with `TOKEN_ENCRYPTION_KEY`; insecure token storage is disabled by default.
 
 Actual guardrails already present:
 - conservative classification when uncertain: the prompt explicitly says to choose the conservative category and lower confidence
 - bulk / no-reply suppression: extraction and scoring downrank automated, no-reply, digest, and promotion-style messages
 - grounded answers with citations: Ask Inbox returns cited email ids rather than freeform unsupported claims
+- malformed Ask Inbox model output fallback: if OpenAI returns invalid JSON, the app falls back to a deterministic grounded answer instead of hard-failing the request
 
 ## Limitations
 - OpenAI dependency for ranking and Q&A: the strongest extraction and retrieval experience depends on OpenAI services.
 - No full prompt-injection defense layer: email content can still contain adversarial instructions that are not fully sandboxed semantically.
 - No autonomous email sending: the system reads, ranks, and answers, but it does not safely send email on the user's behalf.
 - Possible misclassification on ambiguous emails: mixed-purpose updates, vague subject lines, or incomplete bodies can still be scored imperfectly.
+- Ask Inbox logs are filesystem-based and session-scoped: they are cleared on backend relaunch and are not yet searchable in the product UI.
 
 ## Prompt Iteration Log
 See `docs/prompt-iteration-log.md` for the initial prompt, failure mode, and final prompt strategy.
